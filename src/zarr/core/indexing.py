@@ -29,7 +29,6 @@ from zarr.core.metadata.v3 import ArrayV3Metadata
 from zarr.errors import (
     ArrayIndexError,
     BoundsCheckError,
-    NegativeStepError,
     VindexInvalidSelectionError,
 )
 
@@ -404,10 +403,11 @@ class SliceDimIndexer:
         dim_len: int,
         dim_grid: DimensionGrid,
     ) -> None:
-        # normalize
+        # normalize, following Python slice semantics for both positive and
+        # negative steps (e.g. slice(None, None, -1) keeps stop=-1, meaning
+        # "down to and including 0", while an explicit stop of -1 resolves to
+        # dim_len - 1)
         start, stop, step = dim_sel.indices(dim_len)
-        if step < 1:
-            raise NegativeStepError("only slices with step >= 1 are supported.")
 
         object.__setattr__(self, "start", start)
         object.__setattr__(self, "stop", stop)
@@ -415,14 +415,21 @@ class SliceDimIndexer:
 
         object.__setattr__(self, "dim_len", dim_len)
         object.__setattr__(self, "dim_grid", dim_grid)
-        object.__setattr__(self, "nitems", max(0, ceildiv((stop - start), step)))
+        if step > 0:
+            nitems = max(0, ceildiv((stop - start), step))
+        else:
+            nitems = max(0, ceildiv((start - stop), -step))
+        object.__setattr__(self, "nitems", nitems)
         object.__setattr__(self, "nchunks", dim_grid.nchunks)
 
     def __iter__(self) -> Iterator[ChunkDimProjection]:
         # figure out the range of chunks we need to visit
-        if self.start >= self.stop:
+        if self.nitems == 0:
             return  # empty slice
         g = self.dim_grid
+        if self.step < 0:
+            yield from self._iter_negative_step(g)
+            return
         dim_chunk_ix_from = g.index_to_chunk(self.start) if self.start > 0 else 0
         dim_chunk_ix_to = g.index_to_chunk(self.stop - 1) + 1 if self.stop > 0 else 0
 
@@ -466,6 +473,49 @@ class SliceDimIndexer:
                 dim_chunk_sel_start == 0 and (self.stop >= dim_limit) and self.step in [1, None]
             )
             yield ChunkDimProjection(dim_chunk_ix, dim_chunk_sel, dim_out_sel, is_complete_chunk)
+
+    def _iter_negative_step(self, g: DimensionGrid) -> Iterator[ChunkDimProjection]:
+        # selected indices are start, start + step, ..., last, in decreasing
+        # order; visit chunks from the one containing start down to the one
+        # containing last so that output offsets accumulate in selection order
+        last = self.start + (self.nitems - 1) * self.step
+        dim_chunk_ix_lo = g.index_to_chunk(last)
+        dim_chunk_ix_hi = g.index_to_chunk(self.start)
+
+        dim_out_offset = 0
+        for dim_chunk_ix in range(dim_chunk_ix_hi, dim_chunk_ix_lo - 1, -1):
+            # compute offsets for chunk within overall array
+            dim_offset = g.chunk_offset(dim_chunk_ix)
+            # determine chunk length, accounting for trailing chunk
+            dim_chunk_len = g.data_size(dim_chunk_ix)
+            dim_limit = dim_offset + dim_chunk_len
+
+            # selected positions are start + k * step for k in [0, nitems);
+            # find the k range whose positions fall inside this chunk
+            # k_min: smallest k with start + k * step <= dim_limit - 1
+            k_min = max(0, -((self.start - dim_limit + 1) // self.step))
+            # k_max (exclusive): one past the largest k with start + k * step >= dim_offset
+            k_max = min(self.nitems, (dim_offset - self.start) // self.step + 1)
+
+            dim_chunk_nitems = k_max - k_min
+            # If there are no elements on the selection within this chunk, then skip
+            if dim_chunk_nitems <= 0:
+                continue
+
+            # first (largest) and last (smallest) selected index within this chunk
+            dim_chunk_sel_start = self.start + k_min * self.step - dim_offset
+            dim_chunk_sel_stop = self.start + (k_max - 1) * self.step - dim_offset - 1
+            # a stop of -1 would be reinterpreted as the final element, so use
+            # None when the selection runs down to and including position 0
+            dim_chunk_sel = slice(
+                dim_chunk_sel_start,
+                dim_chunk_sel_stop if dim_chunk_sel_stop >= 0 else None,
+                self.step,
+            )
+
+            dim_out_sel = slice(dim_out_offset, dim_out_offset + dim_chunk_nitems)
+            dim_out_offset += dim_chunk_nitems
+            yield ChunkDimProjection(dim_chunk_ix, dim_chunk_sel, dim_out_sel, False)
 
 
 def check_selection_length(selection: SelectionNormalized, shape: tuple[int, ...]) -> None:
@@ -565,7 +615,7 @@ def is_contiguous_selection(selection: Any) -> TypeGuard[slice]:
 
 def is_basic_selection(selection: Any) -> TypeGuard[BasicSelection]:
     selection = ensure_tuple(selection)
-    return all(is_integer(s) or is_positive_slice(s) for s in selection)
+    return all(is_integer(s) or is_slice(s) for s in selection)
 
 
 @dataclass(frozen=True)

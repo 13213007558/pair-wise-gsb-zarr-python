@@ -628,10 +628,6 @@ def sharded_arrays(
     return a
 
 
-def is_negative_slice(idx: Any) -> bool:
-    return isinstance(idx, slice) and idx.step is not None and idx.step < 0
-
-
 @st.composite
 def end_slices(draw: st.DrawFn, *, shape: tuple[int, ...]) -> Any:
     """
@@ -657,20 +653,13 @@ def basic_indices(
     allow_newaxis: TrueOrFalse = False,
     allow_ellipsis: TrueOrFalse = True,
 ) -> Any:
-    """Basic indices without unsupported negative slices."""
+    """Basic indices, including slices with negative steps."""
     strategy = npst.basic_indices(
         shape=shape,
         min_dims=min_dims,
         max_dims=max_dims,
         allow_newaxis=allow_newaxis,
         allow_ellipsis=allow_ellipsis,
-    ).filter(
-        lambda idxr: (
-            not (
-                is_negative_slice(idxr)
-                or (isinstance(idxr, tuple) and any(is_negative_slice(idx) for idx in idxr))
-            )
-        )
     )
     if math.prod(shape) >= 3:
         strategy = end_slices(shape=shape) | strategy
