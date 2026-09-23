@@ -132,6 +132,7 @@ from zarr.core.metadata.v3 import (
     create_chunk_grid_metadata,
     parse_node_type_array,
 )
+from zarr.core.reduction import async_reduce_mean, async_reduce_sum, async_reduce_variance
 from zarr.core.sync import sync
 from zarr.errors import (
     ArrayNotFoundError,
@@ -1306,6 +1307,167 @@ class AsyncArray[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         """
         return await _nshards_initialized(self)
 
+    async def sum(
+        self,
+        axis: int | Iterable[int] | None = None,
+        *,
+        keepdims: bool = False,
+        dtype: np.dtype[Any] | None = None,
+        nan_policy: Literal["propagate", "omit"] = "propagate",
+        out: np.ndarray[Any, np.dtype[Any]] | None = None,
+    ) -> np.ndarray[Any, np.dtype[Any]] | np.generic:
+        """
+        Sum of array elements over the given axis or axes, computed block by block.
+
+        The array is never fully loaded into memory: data is read one stored
+        block (shard, or chunk when sharding is not used) at a time, so the
+        working set scales with the block size rather than the total number of
+        elements. Blocks that have not been written to storage are treated as
+        filled with the fill value of the array and contribute to the sum.
+
+        Parameters
+        ----------
+        axis : int | Iterable[int] | None, optional
+            Axis or axes along which to sum. The default, axis=None, sums over
+            all dimensions.
+        keepdims : bool, optional
+            If True, the reduced axes are left in the result with size 1.
+        dtype : np.dtype, optional
+            Accumulator and result dtype. The default follows the type
+            promotion rules of np.sum.
+        nan_policy : {"propagate", "omit"}, optional
+            How to treat NaN values: "propagate" (default) yields NaN for any
+            output whose reduction contains a NaN, while "omit" ignores NaN
+            values. Only meaningful for inexact dtypes.
+        out : np.ndarray, optional
+            Array into which the result is written. Must have the shape of the
+            reduction result.
+
+        Returns
+        -------
+        np.ndarray | np.generic
+            The sum as a NumPy scalar if every axis is reduced and keepdims is
+            False, otherwise a NumPy array. If out is given, it is returned.
+
+        See Also
+        --------
+        AsyncArray.mean, AsyncArray.variance
+        """
+        return await async_reduce_sum(
+            self, axis, keepdims=keepdims, dtype=dtype, nan_policy=nan_policy, out=out
+        )
+
+    async def mean(
+        self,
+        axis: int | Iterable[int] | None = None,
+        *,
+        keepdims: bool = False,
+        dtype: np.dtype[Any] | None = None,
+        nan_policy: Literal["propagate", "omit"] = "propagate",
+        out: np.ndarray[Any, np.dtype[Any]] | None = None,
+    ) -> np.ndarray[Any, np.dtype[Any]] | np.generic:
+        """
+        Mean of array elements over the given axis or axes, computed block by block.
+
+        The array is never fully loaded into memory: data is read one stored
+        block (shard, or chunk when sharding is not used) at a time, so the
+        working set scales with the block size rather than the total number of
+        elements. Blocks that have not been written to storage are treated as
+        filled with the fill value of the array and count towards the number of
+        observations. The mean of an empty reduction is NaN.
+
+        Parameters
+        ----------
+        axis : int | Iterable[int] | None, optional
+            Axis or axes along which to average. The default, axis=None,
+            averages over all dimensions.
+        keepdims : bool, optional
+            If True, the reduced axes are left in the result with size 1.
+        dtype : np.dtype, optional
+            Floating point (or complex) accumulator and result dtype. Defaults
+            to float64.
+        nan_policy : {"propagate", "omit"}, optional
+            How to treat NaN values: "propagate" (default) yields NaN for any
+            output whose reduction contains a NaN, while "omit" ignores NaN
+            values. Only meaningful for inexact dtypes.
+        out : np.ndarray, optional
+            Array into which the result is written. Must have the shape of the
+            reduction result.
+
+        Returns
+        -------
+        np.ndarray | np.generic
+            The mean as a NumPy scalar if every axis is reduced and keepdims is
+            False, otherwise a NumPy array. If out is given, it is returned.
+
+        See Also
+        --------
+        AsyncArray.sum, AsyncArray.variance
+        """
+        return await async_reduce_mean(
+            self, axis, keepdims=keepdims, dtype=dtype, nan_policy=nan_policy, out=out
+        )
+
+    async def variance(
+        self,
+        axis: int | Iterable[int] | None = None,
+        *,
+        ddof: int = 0,
+        keepdims: bool = False,
+        dtype: np.dtype[Any] | None = None,
+        nan_policy: Literal["propagate", "omit"] = "propagate",
+        out: np.ndarray[Any, np.dtype[Any]] | None = None,
+    ) -> np.ndarray[Any, np.dtype[Any]] | np.generic:
+        """
+        Variance of array elements over the given axis or axes, computed block by block.
+
+        The array is never fully loaded into memory: data is read one stored
+        block (shard, or chunk when sharding is not used) at a time, and the
+        per-block count/mean/M2 statistics are merged with the numerically
+        stable pairwise update of Chan et al. (1979). The variance is therefore
+        accurate even when the mean is large relative to the spread, and is
+        never computed by subtracting two large sums of squares. Blocks that
+        have not been written to storage are treated as filled with the fill
+        value of the array and count towards the number of observations. The
+        variance of fewer than ddof + 1 observations is NaN.
+
+        Parameters
+        ----------
+        axis : int | Iterable[int] | None, optional
+            Axis or axes along which to compute the variance. The default,
+            axis=None, uses all dimensions.
+        ddof : int, optional
+            Delta degrees of freedom: the divisor is N - ddof, where N is the
+            number of observations. The default, 0, gives the population
+            variance; use 1 for the sample variance.
+        keepdims : bool, optional
+            If True, the reduced axes are left in the result with size 1.
+        dtype : np.dtype, optional
+            Floating point (or complex) accumulator dtype. The result is real
+            with the corresponding precision. Defaults to float64.
+        nan_policy : {"propagate", "omit"}, optional
+            How to treat NaN values: "propagate" (default) yields NaN for any
+            output whose reduction contains a NaN, while "omit" ignores NaN
+            values. Only meaningful for inexact dtypes.
+        out : np.ndarray, optional
+            Array into which the result is written. Must have the shape of the
+            reduction result.
+
+        Returns
+        -------
+        np.ndarray | np.generic
+            The variance as a NumPy scalar if every axis is reduced and
+            keepdims is False, otherwise a NumPy array. If out is given, it is
+            returned.
+
+        See Also
+        --------
+        AsyncArray.sum, AsyncArray.mean
+        """
+        return await async_reduce_variance(
+            self, axis, ddof=ddof, keepdims=keepdims, dtype=dtype, nan_policy=nan_policy, out=out
+        )
+
     async def nbytes_stored(self) -> int:
         return await _nbytes_stored(self.store_path)
 
@@ -2410,6 +2572,202 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         size : int
         """
         return sync(self.async_array.nbytes_stored())
+
+    def sum(
+        self,
+        axis: int | Iterable[int] | None = None,
+        *,
+        keepdims: bool = False,
+        dtype: np.dtype[Any] | None = None,
+        nan_policy: Literal["propagate", "omit"] = "propagate",
+        out: np.ndarray[Any, np.dtype[Any]] | None = None,
+    ) -> np.ndarray[Any, np.dtype[Any]] | np.generic:
+        """
+        Sum of array elements over the given axis or axes, computed block by block.
+
+        The array is never fully loaded into memory: data is read one stored
+        block (shard, or chunk when sharding is not used) at a time, so the
+        working set scales with the block size rather than the total number of
+        elements. Blocks that have not been written to storage are treated as
+        filled with the fill value of the array and contribute to the sum.
+
+        Parameters
+        ----------
+        axis : int | Iterable[int] | None, optional
+            Axis or axes along which to sum. The default, axis=None, sums over
+            all dimensions.
+        keepdims : bool, optional
+            If True, the reduced axes are left in the result with size 1.
+        dtype : np.dtype, optional
+            Accumulator and result dtype. The default follows the type
+            promotion rules of np.sum.
+        nan_policy : {"propagate", "omit"}, optional
+            How to treat NaN values: "propagate" (default) yields NaN for any
+            output whose reduction contains a NaN, while "omit" ignores NaN
+            values. Only meaningful for inexact dtypes.
+        out : np.ndarray, optional
+            Array into which the result is written. Must have the shape of the
+            reduction result.
+
+        Returns
+        -------
+        np.ndarray | np.generic
+            The sum as a NumPy scalar if every axis is reduced and keepdims is
+            False, otherwise a NumPy array. If out is given, it is returned.
+
+        See Also
+        --------
+        Array.mean, Array.variance
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> import zarr
+        >>> arr = zarr.create_array({}, shape=(4, 6), chunks=(2, 3), dtype="f8")
+        >>> arr[:] = np.arange(24.0).reshape(4, 6)
+        >>> arr.sum(axis=1)
+        array([ 15.,  51.,  87., 123.])
+        >>> arr.sum(axis=1, keepdims=True).shape
+        (4, 1)
+        """
+        return sync(
+            self.async_array.sum(
+                axis, keepdims=keepdims, dtype=dtype, nan_policy=nan_policy, out=out
+            )
+        )
+
+    def mean(
+        self,
+        axis: int | Iterable[int] | None = None,
+        *,
+        keepdims: bool = False,
+        dtype: np.dtype[Any] | None = None,
+        nan_policy: Literal["propagate", "omit"] = "propagate",
+        out: np.ndarray[Any, np.dtype[Any]] | None = None,
+    ) -> np.ndarray[Any, np.dtype[Any]] | np.generic:
+        """
+        Mean of array elements over the given axis or axes, computed block by block.
+
+        The array is never fully loaded into memory: data is read one stored
+        block (shard, or chunk when sharding is not used) at a time, so the
+        working set scales with the block size rather than the total number of
+        elements. Blocks that have not been written to storage are treated as
+        filled with the fill value of the array and count towards the number of
+        observations. The mean of an empty reduction is NaN.
+
+        Parameters
+        ----------
+        axis : int | Iterable[int] | None, optional
+            Axis or axes along which to average. The default, axis=None,
+            averages over all dimensions.
+        keepdims : bool, optional
+            If True, the reduced axes are left in the result with size 1.
+        dtype : np.dtype, optional
+            Floating point (or complex) accumulator and result dtype. Defaults
+            to float64.
+        nan_policy : {"propagate", "omit"}, optional
+            How to treat NaN values: "propagate" (default) yields NaN for any
+            output whose reduction contains a NaN, while "omit" ignores NaN
+            values. Only meaningful for inexact dtypes.
+        out : np.ndarray, optional
+            Array into which the result is written. Must have the shape of the
+            reduction result.
+
+        Returns
+        -------
+        np.ndarray | np.generic
+            The mean as a NumPy scalar if every axis is reduced and keepdims is
+            False, otherwise a NumPy array. If out is given, it is returned.
+
+        See Also
+        --------
+        Array.sum, Array.variance
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> import zarr
+        >>> arr = zarr.create_array({}, shape=(4, 6), chunks=(2, 3), dtype="f8")
+        >>> arr[:] = np.arange(24.0).reshape(4, 6)
+        >>> arr.mean(axis=0)
+        array([ 9., 10., 11., 12., 13., 14.])
+        """
+        return sync(
+            self.async_array.mean(
+                axis, keepdims=keepdims, dtype=dtype, nan_policy=nan_policy, out=out
+            )
+        )
+
+    def variance(
+        self,
+        axis: int | Iterable[int] | None = None,
+        *,
+        ddof: int = 0,
+        keepdims: bool = False,
+        dtype: np.dtype[Any] | None = None,
+        nan_policy: Literal["propagate", "omit"] = "propagate",
+        out: np.ndarray[Any, np.dtype[Any]] | None = None,
+    ) -> np.ndarray[Any, np.dtype[Any]] | np.generic:
+        """
+        Variance of array elements over the given axis or axes, computed block by block.
+
+        The array is never fully loaded into memory: data is read one stored
+        block (shard, or chunk when sharding is not used) at a time, and the
+        per-block count/mean/M2 statistics are merged with the numerically
+        stable pairwise update of Chan et al. (1979). The variance is therefore
+        accurate even when the mean is large relative to the spread, and is
+        never computed by subtracting two large sums of squares. Blocks that
+        have not been written to storage are treated as filled with the fill
+        value of the array and count towards the number of observations. The
+        variance of fewer than ddof + 1 observations is NaN.
+
+        Parameters
+        ----------
+        axis : int | Iterable[int] | None, optional
+            Axis or axes along which to compute the variance. The default,
+            axis=None, uses all dimensions.
+        ddof : int, optional
+            Delta degrees of freedom: the divisor is N - ddof, where N is the
+            number of observations. The default, 0, gives the population
+            variance; use 1 for the sample variance.
+        keepdims : bool, optional
+            If True, the reduced axes are left in the result with size 1.
+        dtype : np.dtype, optional
+            Floating point (or complex) accumulator dtype. The result is real
+            with the corresponding precision. Defaults to float64.
+        nan_policy : {"propagate", "omit"}, optional
+            How to treat NaN values: "propagate" (default) yields NaN for any
+            output whose reduction contains a NaN, while "omit" ignores NaN
+            values. Only meaningful for inexact dtypes.
+        out : np.ndarray, optional
+            Array into which the result is written. Must have the shape of the
+            reduction result.
+
+        Returns
+        -------
+        np.ndarray | np.generic
+            The variance as a NumPy scalar if every axis is reduced and
+            keepdims is False, otherwise a NumPy array. If out is given, it is
+            returned.
+
+        See Also
+        --------
+        Array.sum, Array.mean
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> import zarr
+        >>> arr = zarr.create_array({}, shape=(4, 6), chunks=(2, 3), dtype="f8")
+        >>> arr[:] = np.arange(24.0).reshape(4, 6)
+        >>> arr.variance()
+        np.float64(47.916666666666664)
+        """
+        return sync(
+            self.async_array.variance(
+                axis, ddof=ddof, keepdims=keepdims, dtype=dtype, nan_policy=nan_policy, out=out
+            )
+        )
 
     def _iter_shard_keys(
         self, origin: Sequence[int] | None = None, selection_shape: Sequence[int] | None = None
