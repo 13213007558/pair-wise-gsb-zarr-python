@@ -29,7 +29,6 @@ from zarr.core.metadata.v3 import ArrayV3Metadata
 from zarr.errors import (
     ArrayIndexError,
     BoundsCheckError,
-    NegativeStepError,
     VindexInvalidSelectionError,
 )
 
@@ -406,8 +405,6 @@ class SliceDimIndexer:
     ) -> None:
         # normalize
         start, stop, step = dim_sel.indices(dim_len)
-        if step < 1:
-            raise NegativeStepError("only slices with step >= 1 are supported.")
 
         object.__setattr__(self, "start", start)
         object.__setattr__(self, "stop", stop)
@@ -419,9 +416,15 @@ class SliceDimIndexer:
         object.__setattr__(self, "nchunks", dim_grid.nchunks)
 
     def __iter__(self) -> Iterator[ChunkDimProjection]:
-        # figure out the range of chunks we need to visit
-        if self.start >= self.stop:
+        if self.nitems == 0:
             return  # empty slice
+        if self.step > 0:
+            yield from self._iter_forward()
+        else:
+            yield from self._iter_backward()
+
+    def _iter_forward(self) -> Iterator[ChunkDimProjection]:
+        # figure out the range of chunks we need to visit
         g = self.dim_grid
         dim_chunk_ix_from = g.index_to_chunk(self.start) if self.start > 0 else 0
         dim_chunk_ix_to = g.index_to_chunk(self.stop - 1) + 1 if self.stop > 0 else 0
@@ -465,6 +468,60 @@ class SliceDimIndexer:
             is_complete_chunk = (
                 dim_chunk_sel_start == 0 and (self.stop >= dim_limit) and self.step in [1, None]
             )
+            yield ChunkDimProjection(dim_chunk_ix, dim_chunk_sel, dim_out_sel, is_complete_chunk)
+
+    def _iter_backward(self) -> Iterator[ChunkDimProjection]:
+        # The selected indices are start, start + step, ..., last, in that
+        # (descending) order; the output array follows the same order, so
+        # chunks are visited from the chunk containing the first selected
+        # index down to the chunk containing the final selected index.
+        g = self.dim_grid
+        step = self.step
+        stride = -step  # > 0
+        start = self.start
+        last = start + (self.nitems - 1) * step
+
+        dim_chunk_ix_from = g.index_to_chunk(start)
+        dim_chunk_ix_to = g.index_to_chunk(last)
+
+        # iterate over chunks in range, in descending order
+        for dim_chunk_ix in range(dim_chunk_ix_from, dim_chunk_ix_to - 1, -1):
+            # compute offsets for chunk within overall array
+            dim_offset = g.chunk_offset(dim_chunk_ix)
+            # determine chunk length, accounting for trailing chunk
+            dim_chunk_len = g.data_size(dim_chunk_ix)
+            dim_limit = dim_offset + dim_chunk_len
+
+            # The selected indices form the arithmetic progression
+            # start - k * stride for k in [0, self.nitems). Within this chunk,
+            # the first selected index (in selection order) is the largest
+            # progression value below dim_limit, and the last is the smallest
+            # progression value at or above dim_offset (but not beyond the
+            # final selected index).
+            k_first = max(0, ceildiv(start - (dim_limit - 1), stride))
+            k_last = min((start - dim_offset) // stride, self.nitems - 1)
+
+            # If there are no elements on the selection within this chunk, then skip
+            if k_last < k_first:
+                continue
+
+            dim_chunk_sel_start = start - k_first * stride - dim_offset
+            dim_chunk_sel_stop = start - k_last * stride - dim_offset  # inclusive
+            # A negative-step slice with stop == -1 would be re-normalized to
+            # the end of the chunk, so use None to include chunk index 0.
+            dim_chunk_sel = slice(
+                dim_chunk_sel_start,
+                dim_chunk_sel_stop - 1 if dim_chunk_sel_stop > 0 else None,
+                step,
+            )
+            dim_chunk_nitems = k_last - k_first + 1
+
+            # k_first counts the selected items in earlier (higher) chunks,
+            # providing the offset into the output array
+            dim_out_sel = slice(k_first, k_first + dim_chunk_nitems)
+            # A negative-step selection never maps contiguously onto storage
+            # order, so it cannot reuse the complete-chunk fast paths.
+            is_complete_chunk = False
             yield ChunkDimProjection(dim_chunk_ix, dim_chunk_sel, dim_out_sel, is_complete_chunk)
 
 
@@ -554,10 +611,6 @@ def is_contiguous_slice(s: Any) -> TypeGuard[slice]:
     return is_slice(s) and (s.step is None or s.step == 1)
 
 
-def is_positive_slice(s: Any) -> TypeGuard[slice]:
-    return is_slice(s) and (s.step is None or s.step >= 1)
-
-
 def is_contiguous_selection(selection: Any) -> TypeGuard[slice]:
     selection = ensure_tuple(selection)
     return all((is_integer_array(s) or is_contiguous_slice(s) or s == Ellipsis) for s in selection)
@@ -565,7 +618,7 @@ def is_contiguous_selection(selection: Any) -> TypeGuard[slice]:
 
 def is_basic_selection(selection: Any) -> TypeGuard[BasicSelection]:
     selection = ensure_tuple(selection)
-    return all(is_integer(s) or is_positive_slice(s) for s in selection)
+    return all(is_integer(s) or is_slice(s) for s in selection)
 
 
 @dataclass(frozen=True)
