@@ -160,6 +160,7 @@ if TYPE_CHECKING:
     from zarr.codecs.sharding import IndexLocation, ShardingCodec
     from zarr.core.buffer import Buffer
     from zarr.core.dtype.wrapper import TBaseDType, TBaseScalar
+    from zarr.core.reduction import NanPolicy
     from zarr.storage import StoreLike
     from zarr.types import AnyArray, AnyAsyncArray, ArrayV2, ArrayV3, AsyncArrayV2, AsyncArrayV3
 
@@ -1776,6 +1777,219 @@ class AsyncArray[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         """
         await _update_attributes(self, new_attributes)
         return self
+
+    async def sum(
+        self,
+        axis: int | Sequence[int] | None = None,
+        *,
+        dtype: npt.DTypeLike | None = None,
+        keepdims: bool = False,
+        nan_policy: NanPolicy = "propagate",
+        out: npt.NDArray[Any] | None = None,
+    ) -> npt.NDArray[Any] | Any:
+        """
+        Asynchronously compute the sum of array elements along the given axis or axes.
+
+        The array is reduced chunk by chunk, so the working set scales with the
+        chunk size rather than the total number of elements. Chunks that have
+        not been written to the store contribute their ``fill_value`` and are
+        counted as observations.
+
+        Parameters
+        ----------
+        axis : int or Sequence[int] or None, optional
+            Axis or axes along which to sum. The default, ``axis=None``, sums
+            over all axes.
+        dtype : dtype-like, optional
+            Data type of the accumulator and the result. The default follows
+            NumPy's promotion rules for :func:`numpy.sum`.
+        keepdims : bool, default=False
+            If True, the reduced axes are left in the result with size 1.
+        nan_policy : {"propagate", "omit"}, default="propagate"
+            Whether NaN values poison the result ("propagate") or are excluded
+            from the statistics ("omit"), as in :func:`numpy.nansum`.
+        out : numpy.ndarray, optional
+            Array into which the result is written. It must have the shape of
+            the reduced result (after applying ``keepdims``).
+
+        Returns
+        -------
+        numpy.ndarray or scalar
+            The sum, or ``out`` if it was provided.
+
+        Examples
+        --------
+        >>> async def example():
+        ...     import zarr.api.asynchronous
+        ...
+        ...     async_arr = await zarr.api.asynchronous.create_array(
+        ...         store={}, shape=(4,), chunks=(2,), dtype="f8", fill_value=0,
+        ...     )
+        ...     await async_arr.setitem(slice(None), [1.0, 2.0, 3.0, 4.0])
+        ...     return await async_arr.sum()
+
+        >>> import asyncio
+        >>> asyncio.run(example())
+        np.float64(10.0)
+        """
+        from zarr.core.reduction import reduce_array
+
+        return await reduce_array(
+            self,
+            "sum",
+            axis=axis,
+            dtype=dtype,
+            keepdims=keepdims,
+            nan_policy=nan_policy,
+            out=out,
+        )
+
+    async def mean(
+        self,
+        axis: int | Sequence[int] | None = None,
+        *,
+        dtype: npt.DTypeLike | None = None,
+        keepdims: bool = False,
+        nan_policy: NanPolicy = "propagate",
+        out: npt.NDArray[Any] | None = None,
+    ) -> npt.NDArray[Any] | Any:
+        """
+        Asynchronously compute the mean of array elements along the given axis or axes.
+
+        The array is reduced chunk by chunk, so the working set scales with the
+        chunk size rather than the total number of elements. Chunks that have
+        not been written to the store contribute their ``fill_value`` and are
+        counted as observations.
+
+        Parameters
+        ----------
+        axis : int or Sequence[int] or None, optional
+            Axis or axes along which to average. The default, ``axis=None``,
+            averages over all axes.
+        dtype : dtype-like, optional
+            Data type of the accumulator and the result. The default is at
+            least ``float64`` (``complex128`` for complex input) so that
+            merging statistics across chunks stays numerically stable.
+        keepdims : bool, default=False
+            If True, the reduced axes are left in the result with size 1.
+        nan_policy : {"propagate", "omit"}, default="propagate"
+            Whether NaN values poison the result ("propagate") or are excluded
+            from the statistics ("omit"), as in :func:`numpy.nanmean`.
+        out : numpy.ndarray, optional
+            Array into which the result is written. It must have the shape of
+            the reduced result (after applying ``keepdims``).
+
+        Returns
+        -------
+        numpy.ndarray or scalar
+            The mean, or ``out`` if it was provided. Reducing an empty slice
+            (or, with ``nan_policy="omit"``, an all-NaN slice) yields NaN with
+            a ``RuntimeWarning``, matching :func:`numpy.mean`.
+
+        Examples
+        --------
+        >>> async def example():
+        ...     import zarr.api.asynchronous
+        ...
+        ...     async_arr = await zarr.api.asynchronous.create_array(
+        ...         store={}, shape=(4,), chunks=(2,), dtype="f8", fill_value=0,
+        ...     )
+        ...     await async_arr.setitem(slice(None), [1.0, 2.0, 3.0, 4.0])
+        ...     return await async_arr.mean()
+
+        >>> import asyncio
+        >>> asyncio.run(example())
+        np.float64(2.5)
+        """
+        from zarr.core.reduction import reduce_array
+
+        return await reduce_array(
+            self,
+            "mean",
+            axis=axis,
+            dtype=dtype,
+            keepdims=keepdims,
+            nan_policy=nan_policy,
+            out=out,
+        )
+
+    async def variance(
+        self,
+        axis: int | Sequence[int] | None = None,
+        *,
+        dtype: npt.DTypeLike | None = None,
+        ddof: int = 0,
+        keepdims: bool = False,
+        nan_policy: NanPolicy = "propagate",
+        out: npt.NDArray[Any] | None = None,
+    ) -> npt.NDArray[Any] | Any:
+        """
+        Asynchronously compute the variance of array elements along the given axis or axes.
+
+        The array is reduced chunk by chunk, so the working set scales with the
+        chunk size rather than the total number of elements. Per-chunk
+        statistics are merged with the numerically stable parallel algorithm of
+        Chan et al. (a generalization of Welford's method), which avoids
+        subtracting two large, nearly equal sums of squares. Chunks that have
+        not been written to the store contribute their ``fill_value`` and are
+        counted as observations.
+
+        Parameters
+        ----------
+        axis : int or Sequence[int] or None, optional
+            Axis or axes along which to compute the variance. The default,
+            ``axis=None``, uses all axes.
+        dtype : dtype-like, optional
+            Data type of the accumulator. The default is at least ``float64``
+            (``complex128`` for complex input) so that merging statistics
+            across chunks stays numerically stable. The result is real-valued
+            with the corresponding floating dtype.
+        ddof : int, default=0
+            Delta degrees of freedom: the divisor is ``N - ddof`` where ``N``
+            is the number of (non-omitted) observations.
+        keepdims : bool, default=False
+            If True, the reduced axes are left in the result with size 1.
+        nan_policy : {"propagate", "omit"}, default="propagate"
+            Whether NaN values poison the result ("propagate") or are excluded
+            from the statistics ("omit"), as in :func:`numpy.nanvar`.
+        out : numpy.ndarray, optional
+            Array into which the result is written. It must have the shape of
+            the reduced result (after applying ``keepdims``).
+
+        Returns
+        -------
+        numpy.ndarray or scalar
+            The variance, or ``out`` if it was provided. Slices with
+            ``N - ddof <= 0`` yield NaN with a ``RuntimeWarning``, matching
+            :func:`numpy.var`.
+
+        Examples
+        --------
+        >>> async def example():
+        ...     import zarr.api.asynchronous
+        ...
+        ...     async_arr = await zarr.api.asynchronous.create_array(
+        ...         store={}, shape=(4,), chunks=(2,), dtype="f8", fill_value=0,
+        ...     )
+        ...     await async_arr.setitem(slice(None), [1.0, 2.0, 3.0, 4.0])
+        ...     return await async_arr.variance()
+
+        >>> import asyncio
+        >>> asyncio.run(example())
+        np.float64(1.25)
+        """
+        from zarr.core.reduction import reduce_array
+
+        return await reduce_array(
+            self,
+            "variance",
+            axis=axis,
+            dtype=dtype,
+            ddof=ddof,
+            keepdims=keepdims,
+            nan_policy=nan_policy,
+            out=out,
+        )
 
     def __repr__(self) -> str:
         return f"<AsyncArray {self.store_path} shape={self.shape} dtype={self.dtype}>"
@@ -3999,6 +4213,192 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         """
         new_array = sync(self.async_array.update_attributes(new_attributes))
         return type(self)(new_array)
+
+    def sum(
+        self,
+        axis: int | Sequence[int] | None = None,
+        *,
+        dtype: npt.DTypeLike | None = None,
+        keepdims: bool = False,
+        nan_policy: NanPolicy = "propagate",
+        out: npt.NDArray[Any] | None = None,
+    ) -> npt.NDArray[Any] | Any:
+        """
+        Compute the sum of array elements along the given axis or axes.
+
+        The array is reduced chunk by chunk, so the working set scales with the
+        chunk size rather than the total number of elements. Chunks that have
+        not been written to the store contribute their ``fill_value`` and are
+        counted as observations.
+
+        Parameters
+        ----------
+        axis : int or Sequence[int] or None, optional
+            Axis or axes along which to sum. The default, ``axis=None``, sums
+            over all axes.
+        dtype : dtype-like, optional
+            Data type of the accumulator and the result. The default follows
+            NumPy's promotion rules for :func:`numpy.sum`.
+        keepdims : bool, default=False
+            If True, the reduced axes are left in the result with size 1.
+        nan_policy : {"propagate", "omit"}, default="propagate"
+            Whether NaN values poison the result ("propagate") or are excluded
+            from the statistics ("omit"), as in :func:`numpy.nansum`.
+        out : numpy.ndarray, optional
+            Array into which the result is written. It must have the shape of
+            the reduced result (after applying ``keepdims``).
+
+        Returns
+        -------
+        numpy.ndarray or scalar
+            The sum, or ``out`` if it was provided.
+
+        Examples
+        --------
+        >>> import zarr
+        >>> arr = zarr.create_array(store={}, shape=(4,), chunks=(2,), dtype="f8")
+        >>> arr[:] = [1.0, 2.0, 3.0, 4.0]
+        >>> arr.sum()
+        np.float64(10.0)
+        """
+        return sync(
+            self.async_array.sum(
+                axis=axis,
+                dtype=dtype,
+                keepdims=keepdims,
+                nan_policy=nan_policy,
+                out=out,
+            )
+        )
+
+    def mean(
+        self,
+        axis: int | Sequence[int] | None = None,
+        *,
+        dtype: npt.DTypeLike | None = None,
+        keepdims: bool = False,
+        nan_policy: NanPolicy = "propagate",
+        out: npt.NDArray[Any] | None = None,
+    ) -> npt.NDArray[Any] | Any:
+        """
+        Compute the mean of array elements along the given axis or axes.
+
+        The array is reduced chunk by chunk, so the working set scales with the
+        chunk size rather than the total number of elements. Chunks that have
+        not been written to the store contribute their ``fill_value`` and are
+        counted as observations.
+
+        Parameters
+        ----------
+        axis : int or Sequence[int] or None, optional
+            Axis or axes along which to average. The default, ``axis=None``,
+            averages over all axes.
+        dtype : dtype-like, optional
+            Data type of the accumulator and the result. The default is at
+            least ``float64`` (``complex128`` for complex input) so that
+            merging statistics across chunks stays numerically stable.
+        keepdims : bool, default=False
+            If True, the reduced axes are left in the result with size 1.
+        nan_policy : {"propagate", "omit"}, default="propagate"
+            Whether NaN values poison the result ("propagate") or are excluded
+            from the statistics ("omit"), as in :func:`numpy.nanmean`.
+        out : numpy.ndarray, optional
+            Array into which the result is written. It must have the shape of
+            the reduced result (after applying ``keepdims``).
+
+        Returns
+        -------
+        numpy.ndarray or scalar
+            The mean, or ``out`` if it was provided. Reducing an empty slice
+            (or, with ``nan_policy="omit"``, an all-NaN slice) yields NaN with
+            a ``RuntimeWarning``, matching :func:`numpy.mean`.
+
+        Examples
+        --------
+        >>> import zarr
+        >>> arr = zarr.create_array(store={}, shape=(4,), chunks=(2,), dtype="f8")
+        >>> arr[:] = [1.0, 2.0, 3.0, 4.0]
+        >>> arr.mean()
+        np.float64(2.5)
+        """
+        return sync(
+            self.async_array.mean(
+                axis=axis,
+                dtype=dtype,
+                keepdims=keepdims,
+                nan_policy=nan_policy,
+                out=out,
+            )
+        )
+
+    def variance(
+        self,
+        axis: int | Sequence[int] | None = None,
+        *,
+        dtype: npt.DTypeLike | None = None,
+        ddof: int = 0,
+        keepdims: bool = False,
+        nan_policy: NanPolicy = "propagate",
+        out: npt.NDArray[Any] | None = None,
+    ) -> npt.NDArray[Any] | Any:
+        """
+        Compute the variance of array elements along the given axis or axes.
+
+        The array is reduced chunk by chunk, so the working set scales with the
+        chunk size rather than the total number of elements. Per-chunk
+        statistics are merged with the numerically stable parallel algorithm of
+        Chan et al. (a generalization of Welford's method), which avoids
+        subtracting two large, nearly equal sums of squares. Chunks that have
+        not been written to the store contribute their ``fill_value`` and are
+        counted as observations.
+
+        Parameters
+        ----------
+        axis : int or Sequence[int] or None, optional
+            Axis or axes along which to compute the variance. The default,
+            ``axis=None``, uses all axes.
+        dtype : dtype-like, optional
+            Data type of the accumulator. The default is at least ``float64``
+            (``complex128`` for complex input) so that merging statistics
+            across chunks stays numerically stable. The result is real-valued
+            with the corresponding floating dtype.
+        ddof : int, default=0
+            Delta degrees of freedom: the divisor is ``N - ddof`` where ``N``
+            is the number of (non-omitted) observations.
+        keepdims : bool, default=False
+            If True, the reduced axes are left in the result with size 1.
+        nan_policy : {"propagate", "omit"}, default="propagate"
+            Whether NaN values poison the result ("propagate") or are excluded
+            from the statistics ("omit"), as in :func:`numpy.nanvar`.
+        out : numpy.ndarray, optional
+            Array into which the result is written. It must have the shape of
+            the reduced result (after applying ``keepdims``).
+
+        Returns
+        -------
+        numpy.ndarray or scalar
+            The variance, or ``out`` if it was provided. Slices with
+            ``N - ddof <= 0`` yield NaN with a ``RuntimeWarning``, matching
+            :func:`numpy.var`.
+
+        Examples
+        --------
+        >>> import zarr
+        >>> arr = zarr.create_array(store={}, shape=(4,), chunks=(2,), dtype="f8")
+        >>> arr[:] = [1.0, 2.0, 3.0, 4.0]
+        >>> arr.variance()
+        np.float64(1.25)
+        """
+        return sync(
+            self.async_array.variance(
+                axis=axis,
+                dtype=dtype,
+                ddof=ddof,
+                keepdims=keepdims,
+                nan_policy=nan_policy,
+                out=out,
+            )
+        )
 
     def __repr__(self) -> str:
         return f"<Array {self.store_path} shape={self.shape} dtype={self.dtype}>"
