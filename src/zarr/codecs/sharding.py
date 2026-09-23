@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import os
+import tempfile
 from collections.abc import Iterable, Mapping, MutableMapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from functools import lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, NamedTuple
 
 import numpy as np
@@ -1804,3 +1808,209 @@ class ShardingCodec(
     def compute_encoded_size(self, input_byte_length: int, shard_spec: ArraySpec) -> int:
         chunks_per_shard = self._get_chunks_per_shard(shard_spec)
         return input_byte_length + self._shard_index_size(chunks_per_shard)
+
+
+class ShardIndexCorruptionError(ValueError):
+    """A shard index failed validation during offline shard compaction.
+
+    ``entries`` holds the inner-chunk coordinates (within the shard's chunk
+    grid) of every index entry involved in the corruption, so the offending
+    chunks can be located without decoding any chunk payload.
+    """
+
+    entries: tuple[tuple[int, ...], ...]
+
+    def __init__(self, message: str, entries: Iterable[tuple[int, ...]] = ()) -> None:
+        super().__init__(message)
+        self.entries = tuple(entries)
+
+
+@dataclass(frozen=True)
+class ShardCompactionReport:
+    """Summary of a single :func:`compact_shard` / :func:`compact_shard_bytes` run."""
+
+    chunks_per_shard: tuple[int, ...]
+    index_location: IndexLocation
+    # index entries referencing a byte range
+    chunks_present: int
+    # index entries holding the empty-chunk marker
+    chunks_empty: int
+    # distinct byte ranges referenced by more than one chunk (shared payloads)
+    shared_ranges: int
+    source_size: int
+    compacted_size: int
+
+    @property
+    def bytes_reclaimed(self) -> int:
+        return self.source_size - self.compacted_size
+
+
+def _data_section_bounds(
+    shard_size: int, index_location: IndexLocation, index_size: int
+) -> tuple[int, int]:
+    """Byte range of a shard's data section, i.e. the shard minus its index."""
+    if index_location == "start":
+        return (index_size, shard_size)
+    return (0, shard_size - index_size)
+
+
+def compact_shard_bytes(
+    shard_bytes: bytes | Buffer,
+    *,
+    codec: ShardingCodec,
+    chunks_per_shard: tuple[int, ...],
+) -> tuple[bytes, ShardCompactionReport]:
+    """Compact one encoded shard in memory, returning the new shard bytes.
+
+    Rewrites the shard so that the byte ranges still referenced by the shard
+    index are packed contiguously (in their original relative order) with no
+    unreferenced gaps, and the index offsets are updated to match. Chunk
+    payloads are copied verbatim - they are never decoded or recompressed -
+    and empty-chunk markers are preserved as-is. Both ``index_location``
+    layouts ("start" and "end") are supported.
+
+    The index (including its checksum, via ``codec.index_codecs``) and every
+    referenced byte range are validated before any output is produced:
+
+    - a range pointing outside the shard's data section is corruption;
+    - two chunks whose ranges partially overlap are corruption;
+    - multiple chunks referencing the *identical* range are permitted by the
+      sharding format and share a single payload copy in the output.
+
+    Raises
+    ------
+    ShardIndexCorruptionError
+        If the index fails validation; the inner-chunk coordinates involved
+        are available on ``error.entries`` and in the message.
+    ValueError
+        If the index itself cannot be decoded (e.g. checksum mismatch).
+    """
+    data = shard_bytes.to_bytes() if isinstance(shard_bytes, Buffer) else bytes(shard_bytes)
+    index_size = codec._shard_index_size(chunks_per_shard)
+    if len(data) < index_size:
+        raise ShardIndexCorruptionError(
+            f"Shard of {len(data)} bytes is too small to hold its {index_size}-byte index."
+        )
+    data_start, data_end = _data_section_bounds(len(data), codec.index_location, index_size)
+    if codec.index_location == "start":
+        index_bytes = data[:index_size]
+    else:
+        index_bytes = data[data_end:]
+    index_buffer = default_buffer_prototype().buffer.from_bytes(index_bytes)
+    # Decoding runs the index_codecs (crc32c by default), so a checksum
+    # mismatch raises here, before anything else happens.
+    index = codec._decode_shard_index_sync(index_buffer, chunks_per_shard)
+
+    # Validate every entry and group live chunks by their exact byte range.
+    range_members: dict[tuple[int, int], list[tuple[int, ...]]] = {}
+    chunks_empty = 0
+    for coords in lexicographic_order_coords(chunks_per_shard):
+        offset, length = (int(v) for v in index.offsets_and_lengths[coords])
+        if (offset, length) == (MAX_UINT_64, MAX_UINT_64):
+            chunks_empty += 1
+            continue
+        if offset < data_start or length > data_end - offset:
+            raise ShardIndexCorruptionError(
+                f"Chunk {coords} references byte range [{offset}, {offset + length}), "
+                f"which lies outside the shard data section [{data_start}, {data_end}).",
+                entries=(coords,),
+            )
+        range_members.setdefault((offset, length), []).append(coords)
+
+    # Partial overlaps between distinct ranges are corruption. Identical
+    # ranges (already grouped above) are legal sharing per the format and are
+    # stored once. Zero-length ranges occupy no bytes and cannot overlap.
+    sorted_ranges = sorted(r for r in range_members if r[1] > 0)
+    max_end = -1
+    max_range: tuple[int, int] | None = None
+    for byte_range in sorted_ranges:
+        if byte_range[0] < max_end and max_range is not None:
+            raise ShardIndexCorruptionError(
+                f"Chunks {range_members[max_range]} at range {max_range} partially overlap "
+                f"chunks {range_members[byte_range]} at range {byte_range}.",
+                entries=(*range_members[max_range], *range_members[byte_range]),
+            )
+        if byte_range[0] + byte_range[1] > max_end:
+            max_end = byte_range[0] + byte_range[1]
+            max_range = byte_range
+
+    # Repack: copy each distinct range once, in original offset order, and
+    # point every referencing index entry at the new offset.
+    new_offsets: dict[tuple[int, int], int] = {}
+    pieces: list[bytes] = []
+    cursor = data_start
+    for byte_range in sorted(range_members):
+        offset, length = byte_range
+        new_offsets[byte_range] = cursor
+        pieces.append(data[offset : offset + length])
+        cursor += length
+    new_offsets_and_lengths = index.offsets_and_lengths.copy()
+    for (offset, length), members in range_members.items():
+        for coords in members:
+            new_offsets_and_lengths[coords] = (new_offsets[(offset, length)], length)
+    new_index_bytes = codec._encode_shard_index_sync(
+        _ShardIndex(chunks_per_shard, new_offsets_and_lengths)
+    ).to_bytes()
+    if len(new_index_bytes) != index_size:
+        raise RuntimeError(
+            f"Re-encoded shard index is {len(new_index_bytes)} bytes, expected {index_size}."
+        )
+    payload = b"".join(pieces)
+    if codec.index_location == "start":
+        compacted = new_index_bytes + payload
+    else:
+        compacted = payload + new_index_bytes
+
+    report = ShardCompactionReport(
+        chunks_per_shard=chunks_per_shard,
+        index_location=codec.index_location,
+        chunks_present=sum(len(members) for members in range_members.values()),
+        chunks_empty=chunks_empty,
+        shared_ranges=sum(1 for members in range_members.values() if len(members) > 1),
+        source_size=len(data),
+        compacted_size=len(compacted),
+    )
+    return compacted, report
+
+
+def compact_shard(
+    source: str | Path,
+    target: str | Path,
+    *,
+    codec: ShardingCodec,
+    chunks_per_shard: tuple[int, ...],
+) -> ShardCompactionReport:
+    """Compact one shard file offline, writing the result to a new file.
+
+    ``source`` is only ever read; the compacted shard is written to
+    ``target``, which must be a different path. The output is published
+    atomically (written to a temporary file in the target directory, then
+    renamed), so a validation or I/O failure leaves neither a modified source
+    nor a partial target behind. See :func:`compact_shard_bytes` for the
+    validation and compaction semantics.
+    """
+    source_path = Path(source)
+    target_path = Path(target)
+    if source_path.resolve() == target_path.resolve():
+        raise ValueError(
+            "Source and target must be different paths; "
+            "compaction never modifies the source shard in place."
+        )
+    compacted, report = compact_shard_bytes(
+        source_path.read_bytes(), codec=codec, chunks_per_shard=chunks_per_shard
+    )
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=target_path.parent, prefix=target_path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "wb") as tmp_file:
+            tmp_file.write(compacted)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_name, target_path)
+    except BaseException:
+        with suppress(FileNotFoundError):
+            os.unlink(tmp_name)
+        raise
+    return report
