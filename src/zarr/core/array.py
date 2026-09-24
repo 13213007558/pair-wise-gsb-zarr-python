@@ -2662,7 +2662,7 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
 
         Notes
         -----
-        Slices with step > 1 are supported, but slices with negative step are not.
+        Slices with any non-zero step, including negative steps, are supported.
 
         For arrays with a structured dtype, see Zarr format 2 for examples of how to use
         fields
@@ -2763,7 +2763,7 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
 
         Notes
         -----
-        Slices with step > 1 are supported, but slices with negative step are not.
+        Slices with any non-zero step, including negative steps, are supported.
 
         For arrays with a structured dtype, see Zarr format 2 for examples of how to use
         fields
@@ -2908,7 +2908,7 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
 
         Notes
         -----
-        Slices with step > 1 are supported, but slices with negative step are not.
+        Slices with any non-zero step, including negative steps, are supported.
 
         For arrays with a structured dtype, see Zarr format 2 for examples of how to use
         the `fields` parameter.
@@ -3153,7 +3153,7 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         -----
         Orthogonal indexing is also known as outer indexing.
 
-        Slices with step > 1 are supported, but slices with negative step are not.
+        Slices with any non-zero step, including negative steps, are supported.
 
         Related
         -------
@@ -3272,7 +3272,7 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         -----
         Orthogonal indexing is also known as outer indexing.
 
-        Slices with step > 1 are supported, but slices with negative step are not.
+        Slices with any non-zero step, including negative steps, are supported.
 
         Related
         -------

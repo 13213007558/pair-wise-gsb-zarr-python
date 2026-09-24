@@ -2341,6 +2341,44 @@ def test_slice_indexer_empty_slice_at_boundary(dim: FixedDimension | VaryingDime
     assert len(projections) == 0
 
 
+@pytest.mark.parametrize(
+    "dim",
+    [FixedDimension(size=3, extent=10), VaryingDimension([4, 2, 5], extent=10)],
+    ids=["fixed", "varying"],
+)
+@pytest.mark.parametrize(
+    "dim_sel",
+    [
+        slice(None, None, -1),
+        slice(None, None, -2),
+        slice(7, 1, -3),
+        slice(-3, None, -1),
+        slice(9, 2, -4),
+        slice(5, 5, -1),
+    ],
+)
+def test_slice_indexer_negative_step(
+    dim: FixedDimension | VaryingDimension, dim_sel: slice
+) -> None:
+    """SliceDimIndexer projections for negative steps reassemble to the numpy slice."""
+    from zarr.core.indexing import SliceDimIndexer
+
+    indexer = SliceDimIndexer(dim_sel, 10, dim)
+    a = np.arange(10)
+    out = np.empty(indexer.nitems, dtype=int)
+    for p in indexer:
+        dim_offset = dim.chunk_offset(p.dim_chunk_ix)
+        chunk = a[dim_offset : dim_offset + dim.data_size(p.dim_chunk_ix)]
+        assert p.dim_out_sel is not None
+        out[p.dim_out_sel] = chunk[p.dim_chunk_sel]
+        # projections never claim a whole contiguous chunk when reversed
+        assert not p.is_complete_chunk
+    np.testing.assert_array_equal(out, a[dim_sel])
+    # chunks are visited in selection (descending) order
+    ixs = [p.dim_chunk_ix for p in indexer]
+    assert ixs == sorted(ixs, reverse=True)
+
+
 def test_orthogonal_indexer_varying_boundary_advanced() -> None:
     """OrthogonalIndexer with advanced indexing uses per-chunk chunk_size."""
     from zarr.core.indexing import OrthogonalIndexer

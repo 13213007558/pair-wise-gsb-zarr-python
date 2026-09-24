@@ -29,7 +29,6 @@ from zarr.core.metadata.v3 import ArrayV3Metadata
 from zarr.errors import (
     ArrayIndexError,
     BoundsCheckError,
-    NegativeStepError,
     VindexInvalidSelectionError,
 )
 
@@ -406,19 +405,19 @@ class SliceDimIndexer:
     ) -> None:
         # normalize
         start, stop, step = dim_sel.indices(dim_len)
-        if step < 1:
-            raise NegativeStepError("only slices with step >= 1 are supported.")
-
         object.__setattr__(self, "start", start)
         object.__setattr__(self, "stop", stop)
         object.__setattr__(self, "step", step)
 
         object.__setattr__(self, "dim_len", dim_len)
         object.__setattr__(self, "dim_grid", dim_grid)
-        object.__setattr__(self, "nitems", max(0, ceildiv((stop - start), step)))
+        object.__setattr__(self, "nitems", len(range(start, stop, step)))
         object.__setattr__(self, "nchunks", dim_grid.nchunks)
 
     def __iter__(self) -> Iterator[ChunkDimProjection]:
+        if self.step < 0:
+            yield from self._iter_reverse()
+            return
         # figure out the range of chunks we need to visit
         if self.start >= self.stop:
             return  # empty slice
@@ -465,6 +464,71 @@ class SliceDimIndexer:
             is_complete_chunk = (
                 dim_chunk_sel_start == 0 and (self.stop >= dim_limit) and self.step in [1, None]
             )
+            yield ChunkDimProjection(dim_chunk_ix, dim_chunk_sel, dim_out_sel, is_complete_chunk)
+
+    def _iter_reverse(self) -> Iterator[ChunkDimProjection]:
+        """Yield projections for a negative-step selection.
+
+        Chunks are visited from the highest to the lowest index so that
+        projections are emitted in selection (output) order. Within each
+        chunk the selection keeps the user's negative step, while the
+        output selection is always a forward slice.
+        """
+        if self.nitems == 0:
+            return  # empty slice
+        g = self.dim_grid
+        step = self.step
+        stride = -step  # > 0
+        start = self.start
+        # smallest selected index, i.e. the last one in selection order
+        last = start + (self.nitems - 1) * step
+
+        # figure out the range of chunks we need to visit
+        dim_chunk_ix_hi = g.index_to_chunk(start)
+        dim_chunk_ix_lo = g.index_to_chunk(last)
+
+        # iterate over chunks in range, highest first
+        for dim_chunk_ix in range(dim_chunk_ix_hi, dim_chunk_ix_lo - 1, -1):
+            # compute offsets for chunk within overall array
+            dim_offset = g.chunk_offset(dim_chunk_ix)
+            # determine chunk length, accounting for trailing chunk
+            dim_chunk_len = g.data_size(dim_chunk_ix)
+            dim_limit = dim_offset + dim_chunk_len
+
+            if start >= dim_limit:
+                # selection starts above the current chunk; find the largest
+                # selected index below dim_limit
+                first = dim_limit - 1 - ((dim_limit - 1 - start) % stride)
+                # number of selected items in higher chunks, provides offset
+                # into the output array
+                dim_out_offset = (start - dim_limit) // stride + 1
+            else:
+                # selection starts within current chunk
+                first = start
+                dim_out_offset = 0
+
+            # smallest selected index within this chunk, but not below the
+            # overall last selected index
+            last_in_chunk = max(dim_offset + ((start - dim_offset) % stride), last)
+
+            # If there are no items on the selection within this chunk, then skip
+            if first < last_in_chunk:
+                continue
+
+            dim_chunk_nitems = (first - last_in_chunk) // stride + 1
+            dim_chunk_sel_start = first - dim_offset
+            dim_chunk_sel_stop = last_in_chunk + step - dim_offset
+            # a negative stop would wrap around under numpy slice semantics,
+            # so use an open stop when the selection runs down to index 0
+            dim_chunk_sel = slice(
+                dim_chunk_sel_start,
+                dim_chunk_sel_stop if dim_chunk_sel_stop >= 0 else None,
+                step,
+            )
+
+            dim_out_sel = slice(dim_out_offset, dim_out_offset + dim_chunk_nitems)
+            # a reversed selection never maps contiguously onto a whole chunk
+            is_complete_chunk = False
             yield ChunkDimProjection(dim_chunk_ix, dim_chunk_sel, dim_out_sel, is_complete_chunk)
 
 
