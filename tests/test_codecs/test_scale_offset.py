@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import numpy as np
@@ -481,3 +482,154 @@ def test_compute_encoded_size() -> None:
     # The chunk_spec argument is unused; pass any sentinel
     assert codec.compute_encoded_size(input_byte_length=100, _chunk_spec=None) == 100  # type: ignore[arg-type]
     assert codec.compute_encoded_size(input_byte_length=0, _chunk_spec=None) == 0  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Integer overflow exactness, checked against a Python-int reference
+# ---------------------------------------------------------------------------
+
+_INT_DTYPES = ["int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64"]
+
+
+def _boundary_values(dtype: np.dtype[Any]) -> list[int]:
+    """Values on both sides of a dtype's boundaries, as unbounded Python ints."""
+    info = np.iinfo(dtype)
+    lo, hi = int(info.min), int(info.max)
+    candidates = [lo, lo + 1, lo // 2, -2, -1, 0, 1, 2, hi // 2, hi - 1, hi]
+    return sorted({v for v in candidates if lo <= v <= hi})
+
+
+def _representable_params(dtype: np.dtype[Any]) -> list[tuple[int, int]]:
+    """(offset, scale) pairs representable in ``dtype``, stressing signed +, -, *, //."""
+    info = np.iinfo(dtype)
+    lo, hi = int(info.min), int(info.max)
+    pairs = [(0, 1), (1, 1), (0, 2), (1, 2), (-1, 1), (-1, 2), (0, -1), (1, -2), (3, 7), (-5, 3)]
+    return [(o, s) for o, s in pairs if lo <= o <= hi and lo <= s <= hi]
+
+
+@pytest.mark.parametrize("dtype_name", _INT_DTYPES)
+def test_encode_int_matches_python_reference(dtype_name: str) -> None:
+    """_encode agrees with unbounded Python-int arithmetic at the dtype boundaries.
+
+    When the true result leaves the dtype's range the codec must raise (never return a
+    wrapped array); when it fits, the codec must return it exactly (never falsely reject).
+    """
+    dtype = np.dtype(dtype_name)
+    info = np.iinfo(dtype)
+    lo, hi = int(info.min), int(info.max)
+    values = _boundary_values(dtype)
+    arr = np.array(values, dtype=dtype)
+    original = arr.copy()
+    for offset, scale in _representable_params(dtype):
+        expected = [(v - offset) * scale for v in values]
+        if all(lo <= e <= hi for e in expected):
+            out = _encode(arr, dtype.type(offset), dtype.type(scale))
+            assert out.dtype == dtype
+            assert list(out.tolist()) == expected
+        else:
+            with pytest.raises(ValueError, match="outside the range of dtype"):
+                _encode(arr, dtype.type(offset), dtype.type(scale))
+        # A failed or successful encode must never modify the input in place.
+        np.testing.assert_array_equal(arr, original)
+
+
+@pytest.mark.parametrize("dtype_name", _INT_DTYPES)
+def test_decode_int_matches_python_reference(dtype_name: str) -> None:
+    """_decode agrees with unbounded Python-int arithmetic at the dtype boundaries.
+
+    Encoded inputs are exactly divisible by scale, so decode must reproduce the
+    Python-computed quotient + offset exactly, or raise if it leaves the dtype's range.
+    """
+    dtype = np.dtype(dtype_name)
+    info = np.iinfo(dtype)
+    lo, hi = int(info.min), int(info.max)
+    for offset, scale in _representable_params(dtype):
+        quotients = _boundary_values(dtype)
+        encoded = sorted({q * scale for q in quotients if lo <= q * scale <= hi})
+        arr = np.array(encoded, dtype=dtype)
+        original = arr.copy()
+        # e == q * scale exactly, so Python floor division recovers q for any sign.
+        expected = [e // scale + offset for e in encoded]
+        if all(lo <= x <= hi for x in expected):
+            out = _decode(arr, dtype.type(offset), dtype.type(scale), scale_repr=scale)
+            assert out.dtype == dtype
+            assert list(out.tolist()) == expected
+        else:
+            with pytest.raises(ValueError, match="outside the range of dtype"):
+                _decode(arr, dtype.type(offset), dtype.type(scale), scale_repr=scale)
+        np.testing.assert_array_equal(arr, original)
+
+
+def test_encode_int64_overflow_does_not_wrap() -> None:
+    """Regression: int64 encode must not wrap when (x - offset) * scale exceeds int64.
+
+    The widened path itself computes in int64, so for int64 inputs an overflowing
+    intermediate used to wrap *before* the range check and silently pass. Here
+    2**62 * 2 = 2**63 is exactly one past int64 max.
+    """
+    arr = np.array([2**62], dtype="int64")
+    original = arr.copy()
+    with pytest.raises(ValueError, match="outside the range of dtype int64"):
+        _encode(arr, np.int64(0), np.int64(2))
+    np.testing.assert_array_equal(arr, original)
+
+
+def test_encode_int64_accepts_values_that_fit_despite_failed_static_proof() -> None:
+    """A dtype-wide proof failure must not reject data whose true results fit in int64."""
+    # scale=2**40 overflows int64 for large inputs, so no static proof can pass — but
+    # these particular values are small enough that the true results are representable.
+    arr = np.array([1, -1, 2, 2**22], dtype="int64")
+    out = _encode(arr, np.int64(0), np.int64(2**40))
+    expected = np.array([2**40, -(2**40), 2**41, 2**62], dtype="int64")
+    np.testing.assert_array_equal(out, expected)
+    # One step further and the true result leaves int64: must raise, not wrap.
+    with pytest.raises(ValueError, match="outside the range of dtype int64"):
+        _encode(np.array([2**23], dtype="int64"), np.int64(0), np.int64(2**40))
+
+
+@pytest.mark.parametrize("dtype_name", ["int8", "int16", "int32", "int64"])
+def test_decode_rejects_min_divided_by_minus_one(dtype_name: str) -> None:
+    """min // -1 overflows every signed dtype; decode must raise a stable ValueError.
+
+    numpy's own ``//`` wraps here (and only emits a RuntimeWarning), so this guards
+    against the codec delegating to numpy arithmetic without a range proof.
+    """
+    dtype = np.dtype(dtype_name)
+    arr = np.array([np.iinfo(dtype).min, 0, 4], dtype=dtype)
+    original = arr.copy()
+    with warnings.catch_warnings():
+        # The overflow must surface as ValueError, never as a numpy RuntimeWarning.
+        warnings.simplefilter("error", RuntimeWarning)
+        with pytest.raises(ValueError, match="outside the range of dtype"):
+            _decode(arr, dtype.type(0), dtype.type(-1), scale_repr=-1)
+    np.testing.assert_array_equal(arr, original)
+
+
+def test_provably_safe_int_arrays_do_not_use_object_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provably safe integer arrays keep the vectorized paths.
+
+    Converting every integer array to per-element Python objects would be correct but
+    ~10x slower; the native/widened paths must still be used when the static proofs hold.
+    """
+    from zarr.codecs import scale_offset as scale_offset_module
+
+    def _forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("object path used for a provably safe case")
+
+    monkeypatch.setattr(scale_offset_module, "_encode_int_object", _forbidden)
+    monkeypatch.setattr(scale_offset_module, "_decode_int_object", _forbidden)
+    for dtype_name, offset, scale in [
+        ("int8", 1, 2),
+        ("int32", 1, 2),
+        ("uint8", 0, 2),
+        ("uint32", 0, 3),
+        ("int64", 0, 1),
+        ("uint64", 0, 1),
+    ]:
+        dtype = np.dtype(dtype_name)
+        arr = np.array([0, 1, 2, 3], dtype=dtype)
+        encoded = _encode(arr, dtype.type(offset), dtype.type(scale))
+        decoded = _decode(encoded, dtype.type(offset), dtype.type(scale), scale_repr=scale)
+        np.testing.assert_array_equal(decoded, arr)

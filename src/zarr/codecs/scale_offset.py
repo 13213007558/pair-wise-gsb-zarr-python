@@ -21,30 +21,56 @@ if TYPE_CHECKING:
 _WIDE_INT = np.dtype(np.int64)
 
 
-def _encode_fits_natively(dtype: np.dtype[Any], offset: int, scale: int) -> bool:
-    """Static range proof: is ``(x - offset) * scale`` always in range for every ``x`` in dtype?
+def _encode_fits_in(
+    src: np.dtype[Any], dst: np.dtype[Any], offset: int, scale: int
+) -> bool:
+    """Static range proof: is ``(x - offset) * scale`` always in ``dst`` for every ``x`` in ``src``?
 
     Uses Python ints (unbounded) to avoid overflow in the proof itself.
     """
-    info = np.iinfo(dtype)
-    d_lo = int(info.min) - offset
-    d_hi = int(info.max) - offset
+    s_info = np.iinfo(src)
+    d_info = np.iinfo(dst)
+    d_lo = int(s_info.min) - offset
+    d_hi = int(s_info.max) - offset
     # Taking min/max of both products handles negative scale without a sign branch.
     products = (d_lo * scale, d_hi * scale)
     lo, hi = min(products), max(products)
-    return info.min <= lo and hi <= info.max
+    return int(d_info.min) <= lo and hi <= int(d_info.max)
+
+
+def _encode_fits_natively(dtype: np.dtype[Any], offset: int, scale: int) -> bool:
+    """Static range proof: is ``(x - offset) * scale`` always in range for every ``x`` in dtype?"""
+    return _encode_fits_in(dtype, dtype, offset, scale)
+
+
+def _decode_fits_in(src: np.dtype[Any], dst: np.dtype[Any], offset: int, scale: int) -> bool:
+    """Static range proof for decode: is ``x // scale + offset`` always in ``dst``?"""
+    s_info = np.iinfo(src)
+    d_info = np.iinfo(dst)
+    # x // scale is bounded by the extremes of x / scale (integer division stays within that range)
+    if scale > 0:
+        q_lo, q_hi = int(s_info.min) // scale, int(s_info.max) // scale
+    else:
+        q_lo, q_hi = int(s_info.max) // scale, int(s_info.min) // scale
+    lo, hi = q_lo + offset, q_hi + offset
+    return int(d_info.min) <= lo and hi <= int(d_info.max)
 
 
 def _decode_fits_natively(dtype: np.dtype[Any], offset: int, scale: int) -> bool:
     """Static range proof for decode: is ``x // scale + offset`` always in range?"""
+    return _decode_fits_in(dtype, dtype, offset, scale)
+
+
+def _fits_in_wide_int(dtype: np.dtype[Any]) -> bool:
+    """Can every value of ``dtype`` be cast to ``_WIDE_INT`` (int64) without loss?
+
+    False for uint64 (max 2**64 - 1 exceeds int64). This gates the widened path:
+    ``arr.astype(np.int64)`` silently wraps values that don't fit, so it may only be
+    used when this holds.
+    """
     info = np.iinfo(dtype)
-    # x // scale is bounded by the extremes of x / scale (integer division stays within that range)
-    if scale > 0:
-        q_lo, q_hi = int(info.min) // scale, int(info.max) // scale
-    else:
-        q_lo, q_hi = int(info.max) // scale, int(info.min) // scale
-    lo, hi = q_lo + offset, q_hi + offset
-    return info.min <= lo and hi <= info.max
+    wide = np.iinfo(_WIDE_INT)
+    return int(info.min) >= int(wide.min) and int(info.max) <= int(wide.max)
 
 
 def _check_int_range(
@@ -90,12 +116,15 @@ def _encode_int_native(
 def _encode_int_widened(
     arr: npt.NDArray[np.integer[Any]], offset: np.integer[Any], scale: np.integer[Any]
 ) -> npt.NDArray[np.integer[Any]]:
-    """Overflow-checked integer encode for int8..int64 and uint8..uint32.
+    """Overflow-checked integer encode via int64 arithmetic.
 
     Exists because numpy integer arithmetic silently wraps on overflow, which the spec
-    forbids. We widen to int64, perform the arithmetic there (int64 holds the product of any
-    two values from these dtypes), range-check against the target dtype, then cast back.
-    uint64 cannot use this path because its range exceeds int64 — see ``_encode_uint64``.
+    forbids. We widen to int64, perform the arithmetic there, range-check against the
+    target dtype, then cast back. This is only sound when the caller has proved (via
+    ``_fits_in_wide_int`` and ``_encode_fits_in``) that the source values fit in int64
+    and that no intermediate can overflow int64 — otherwise the int64 arithmetic itself
+    wraps before the range check can see it. int64/uint64 inputs that fail those proofs
+    must use ``_encode_int_object`` instead.
     """
     wide_arr = arr.astype(_WIDE_INT, copy=False)
     result = (wide_arr - _WIDE_INT.type(offset)) * _WIDE_INT.type(scale)
@@ -125,13 +154,13 @@ def _encode_float(
 
 def _check_py_int_range(
     result: np.ndarray[tuple[Any, ...], np.dtype[Any]],
-    target: np.dtype[np.unsignedinteger[Any]],
+    target: np.dtype[np.integer[Any]],
 ) -> None:
     """Range-check an ``object``-dtype ndarray holding Python ints against ``target``'s iinfo.
 
-    Exists as a uint64-specific counterpart to ``_check_int_range``. That one compares numpy
+    Counterpart to ``_check_int_range`` for the Python-int path. That one compares numpy
     integers against ``iinfo``; here the values are unbounded Python ints produced by
-    ``_encode_uint64`` / ``_decode_uint64``, so we rely on Python's arbitrary-precision
+    ``_encode_int_object`` / ``_decode_int_object``, so we rely on Python's arbitrary-precision
     comparison to detect values outside the target dtype's range.
     """
     info = np.iinfo(target)
@@ -146,31 +175,39 @@ def _check_py_int_range(
         )
 
 
-def _encode_uint64(
-    arr: npt.NDArray[np.unsignedinteger[Any]], offset: int, scale: int
-) -> npt.NDArray[np.unsignedinteger[Any]]:
-    """Encode uint64 via Python-int arithmetic in an ``object``-dtype array.
+def _encode_int_object(
+    arr: npt.NDArray[np.integer[Any]], offset: int, scale: int
+) -> npt.NDArray[np.integer[Any]]:
+    """Encode via Python-int arithmetic in an ``object``-dtype array.
 
-    Exists because uint64's range [0, 2**64) exceeds int64, so the int64 widening used by
-    ``_encode_int_widened`` would itself overflow. Python ints are unbounded, so computing
-    via ``object`` dtype is correct by construction. The trade-off is speed: object-dtype
-    arithmetic is interpreted per element and is roughly 10x slower than ufunc paths.
+    Last-resort path for cases the vectorized paths provably cannot handle: uint64 (whose
+    range exceeds int64) and int64 with scale/offset large enough that even int64
+    intermediates could overflow. Python ints are unbounded, so computing via ``object``
+    dtype is correct by construction; the result is range-checked before casting back,
+    so an out-of-range value raises instead of silently wrapping. The trade-off is speed:
+    object-dtype arithmetic is interpreted per element (~10x slower than ufunc paths),
+    which is why this is only used when the static proofs rule out both vectorized paths.
     """
     obj = arr.astype(object, copy=False)
     # np.asarray restores ndarray-ness in the 0-d/scalar edge case.
     result = np.asarray((obj - offset) * scale, dtype=object)
     _check_py_int_range(result, arr.dtype)
-    return cast("npt.NDArray[np.unsignedinteger[Any]]", result.astype(arr.dtype, copy=False))
+    return cast("npt.NDArray[np.integer[Any]]", result.astype(arr.dtype, copy=False))
 
 
-def _decode_uint64(
-    arr: npt.NDArray[np.unsignedinteger[Any]], offset: int, scale: int
-) -> npt.NDArray[np.unsignedinteger[Any]]:
-    """Decode uint64 via Python-int arithmetic. See ``_encode_uint64`` for why."""
+def _decode_int_object(
+    arr: npt.NDArray[np.integer[Any]], offset: int, scale: int
+) -> npt.NDArray[np.integer[Any]]:
+    """Decode via Python-int arithmetic. See ``_encode_int_object`` for why.
+
+    Python floor division matches numpy's ``//`` semantics, and unlike numpy it does
+    not overflow on ``min // -1`` — the true quotient (2**63) is computed exactly and
+    then rejected by the range check.
+    """
     obj = arr.astype(object, copy=False)
     result = np.asarray((obj // scale) + offset, dtype=object)
     _check_py_int_range(result, arr.dtype)
-    return cast("npt.NDArray[np.unsignedinteger[Any]]", result.astype(arr.dtype, copy=False))
+    return cast("npt.NDArray[np.integer[Any]]", result.astype(arr.dtype, copy=False))
 
 
 def _decode_int_native(
@@ -188,10 +225,13 @@ def _decode_int_native(
 def _decode_int_widened(
     arr: npt.NDArray[np.integer[Any]], offset: np.integer[Any], scale: np.integer[Any]
 ) -> npt.NDArray[np.integer[Any]]:
-    """Overflow-checked integer decode for int8..int64 and uint8..uint32.
+    """Overflow-checked integer decode via int64 arithmetic.
 
-    Counterpart to ``_encode_int_widened``. Widens to int64 so the addition of ``offset``
-    after division can't silently wrap, then range-checks against the target dtype.
+    Counterpart to ``_encode_int_widened``; same caller contract. Widens to int64 so the
+    addition of ``offset`` after division can't silently wrap, then range-checks against
+    the target dtype. The ``min // -1`` quotient overflow is excluded by the caller's
+    proof: with scale=-1 the static bounds include 2**63, which doesn't fit in int64,
+    so such inputs are routed to ``_decode_int_object`` instead.
     """
     wide_arr = arr.astype(_WIDE_INT, copy=False)
     result = (wide_arr // _WIDE_INT.type(scale)) + _WIDE_INT.type(offset)
@@ -223,11 +263,6 @@ def _encode(
     scale: np.generic,
 ) -> np.ndarray[tuple[Any, ...], np.dtype[Any]]:
     """Compute ``(arr - offset) * scale`` without silent overflow, returning ``arr.dtype``."""
-    # uint64 is split out first because its full range (up to 2**64-1) doesn't fit in int64,
-    # so the widening strategy used for every other integer dtype would itself overflow.
-    if arr.dtype == np.uint64:
-        u_arr = cast("npt.NDArray[np.unsignedinteger[Any]]", arr)
-        return _encode_uint64(u_arr, int(offset), int(scale))
     if np.issubdtype(arr.dtype, np.integer):
         i_arr = cast("npt.NDArray[np.integer[Any]]", arr)
         i_offset = cast("np.integer[Any]", offset)
@@ -236,7 +271,16 @@ def _encode(
         # skip the int64 widening and run the arithmetic directly in the input dtype.
         if _encode_fits_natively(arr.dtype, int(offset), int(scale)):
             return _encode_int_native(i_arr, i_offset, i_scale)
-        return _encode_int_widened(i_arr, i_offset, i_scale)
+        # Widened path: int64 arithmetic with a range check. Only sound when the source
+        # values fit in int64 AND the proof shows the int64 intermediates can't overflow —
+        # otherwise the widened arithmetic itself wraps before the check can see it.
+        if _fits_in_wide_int(arr.dtype) and _encode_fits_in(
+            arr.dtype, _WIDE_INT, int(offset), int(scale)
+        ):
+            return _encode_int_widened(i_arr, i_offset, i_scale)
+        # Anything else (uint64, or int64 with a large scale/offset) goes through
+        # unbounded Python ints so overflow is detected exactly, never wrapped.
+        return _encode_int_object(i_arr, int(offset), int(scale))
     # Float path: arithmetic stays in-dtype (no widening); only guard against numpy
     # silently promoting a narrower float to a wider one via scalar type mismatch.
     f_arr = cast("npt.NDArray[np.floating[Any]]", arr)
@@ -253,13 +297,6 @@ def _decode(
     scale_repr: object,
 ) -> np.ndarray[tuple[Any, ...], np.dtype[Any]]:
     """Compute ``arr / scale + offset`` without silent overflow, returning ``arr.dtype``."""
-    # uint64: same reasoning as _encode — its range exceeds int64, so the Python-int path is the
-    # only correct option. Exactness check runs first so non-divisible inputs fail before the
-    # slower object-dtype arithmetic.
-    if arr.dtype == np.uint64:
-        u_arr = cast("npt.NDArray[np.unsignedinteger[Any]]", arr)
-        _check_exact_division(u_arr, cast("np.integer[Any]", scale), scale_repr)
-        return _decode_uint64(u_arr, int(offset), int(scale))
     if np.issubdtype(arr.dtype, np.integer):
         i_arr = cast("npt.NDArray[np.integer[Any]]", arr)
         i_offset = cast("np.integer[Any]", offset)
@@ -267,11 +304,18 @@ def _decode(
         # The spec requires decode to use true division and error if the result isn't
         # representable. For integers that means the remainder must be zero; if any element
         # isn't exactly divisible we fail here rather than silently truncating via //.
+        # ``%`` itself is safe even for ``min % -1`` (numpy yields 0, no overflow).
         _check_exact_division(i_arr, i_scale, scale_repr)
         # Fast path mirrors _encode: static proof that ``x // scale + offset`` stays in dtype.
         if _decode_fits_natively(arr.dtype, int(offset), int(scale)):
             return _decode_int_native(i_arr, i_offset, i_scale)
-        return _decode_int_widened(i_arr, i_offset, i_scale)
+        # Widened path: same gating as _encode. The proof also excludes ``min // -1``,
+        # whose true quotient (2**63) doesn't fit in int64 and would wrap in numpy.
+        if _fits_in_wide_int(arr.dtype) and _decode_fits_in(
+            arr.dtype, _WIDE_INT, int(offset), int(scale)
+        ):
+            return _decode_int_widened(i_arr, i_offset, i_scale)
+        return _decode_int_object(i_arr, int(offset), int(scale))
     # Float path: division is well-defined; only guard against dtype promotion.
     f_arr = cast("npt.NDArray[np.floating[Any]]", arr)
     f_offset = cast("np.floating[Any]", offset)
