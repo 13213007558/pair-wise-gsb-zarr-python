@@ -175,6 +175,24 @@ class MemoryStore(Store):
 
         return await concurrent_map(key_ranges, _get, limit=None)
 
+    def getsize_sync(self, key: str) -> int:
+        """Synchronous size lookup without reading the value."""
+        if not self._is_open:
+            self._is_open = True
+        try:
+            return len(self._store_dict[key])
+        except KeyError:
+            raise FileNotFoundError(key) from None
+
+    async def getsize(self, key: str) -> int:
+        # Cheap override: the base implementation reads the whole value.
+        if not self._is_open:
+            await self._open()
+        try:
+            return len(self._store_dict[key])
+        except KeyError:
+            raise FileNotFoundError(key) from None
+
     async def exists(self, key: str) -> bool:
         # docstring inherited
         return key in self._store_dict
@@ -617,6 +635,14 @@ class ManagedMemoryStore(MemoryStore):
     async def exists(self, key: str) -> bool:
         # docstring inherited
         return await super().exists(_join_paths([self.path, key]))
+
+    def getsize_sync(self, key: str) -> int:
+        # docstring inherited
+        return super().getsize_sync(_join_paths([self.path, key]))
+
+    async def getsize(self, key: str) -> int:
+        # docstring inherited
+        return await super().getsize(_join_paths([self.path, key]))
 
     async def set(self, key: str, value: Buffer, byte_range: tuple[int, int] | None = None) -> None:
         # docstring inherited

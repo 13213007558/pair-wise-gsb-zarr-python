@@ -153,6 +153,120 @@ def test_shard_index_localize_chunk() -> None:
 
 
 # ============================================================================
+# _ShardIndex.validate tests
+# ============================================================================
+
+
+def test_shard_index_validate_all_empty() -> None:
+    """An all-empty index is valid in any data section."""
+    index = _ShardIndex.create_empty((2, 2))
+    index.validate(data_section=(0, 0), allow_empty_chunks=False)
+    index.validate(data_section=(16, 100), allow_empty_chunks=True)
+
+
+def test_shard_index_validate_valid() -> None:
+    """A well-formed sparse index passes validation."""
+    index = _ShardIndex.create_empty((3,))
+    index.set_chunk_slice((0,), slice(16, 26))
+    index.set_chunk_slice((2,), slice(26, 30))
+    # index at the start: data section begins after the index
+    index.validate(data_section=(16, 30), allow_empty_chunks=False)
+    # index at the end: data section is a prefix of the blob
+    index.validate(data_section=(0, 30), allow_empty_chunks=False)
+
+
+def test_shard_index_validate_incomplete_missing_marker() -> None:
+    """An entry with the missing marker in only one field is corrupt."""
+    for offset, length in [(MAX_UINT_64, 5), (5, MAX_UINT_64)]:
+        index = _ShardIndex.create_empty((2,))
+        index.offsets_and_lengths[(1,)] = (offset, length)
+        with pytest.raises(ValueError, match="incomplete missing marker"):
+            index.validate(data_section=(0, 100), allow_empty_chunks=False)
+
+
+def test_shard_index_validate_outside_data_section() -> None:
+    """Entries must lie inside the data section, at either index location."""
+    # points into the index region (index at start)
+    index = _ShardIndex.create_empty((2,))
+    index.set_chunk_slice((0,), slice(4, 20))
+    with pytest.raises(ValueError, match="outside the shard's data section"):
+        index.validate(data_section=(16, 100), allow_empty_chunks=False)
+
+    # points past the end of the shard
+    index = _ShardIndex.create_empty((2,))
+    index.set_chunk_slice((0,), slice(50, 150))
+    with pytest.raises(ValueError, match="outside the shard's data section"):
+        index.validate(data_section=(0, 100), allow_empty_chunks=False)
+
+    # points into the index region (index at end)
+    index = _ShardIndex.create_empty((2,))
+    index.set_chunk_slice((0,), slice(90, 110))
+    with pytest.raises(ValueError, match="outside the shard's data section"):
+        index.validate(data_section=(0, 100), allow_empty_chunks=False)
+
+
+def test_shard_index_validate_offset_length_overflow() -> None:
+    """offset + length must be checked without uint64 wraparound.
+
+    (2**64 - 10) + 20 wraps to 6 in uint64 arithmetic, which would look like a
+    small in-bounds range; the check must reject it instead.
+    """
+    index = _ShardIndex.create_empty((2,))
+    index.offsets_and_lengths[(0,)] = (2**64 - 10, 20)
+    with pytest.raises(ValueError, match="outside the shard's data section"):
+        index.validate(data_section=(0, 100), allow_empty_chunks=False)
+
+
+def test_shard_index_validate_overlap_reports_both_coords() -> None:
+    """Overlapping chunks are rejected, naming both sub-chunk coordinates."""
+    index = _ShardIndex.create_empty((2, 2))
+    index.set_chunk_slice((0, 1), slice(0, 50))
+    index.set_chunk_slice((1, 0), slice(40, 60))
+    with pytest.raises(ValueError, match=r"overlapping byte ranges") as exc_info:
+        index.validate(data_section=(0, 100), allow_empty_chunks=False)
+    assert "(0, 1)" in str(exc_info.value)
+    assert "(1, 0)" in str(exc_info.value)
+
+
+def test_shard_index_validate_duplicate_range_is_overlap() -> None:
+    """Two chunks claiming the exact same bytes overlap."""
+    index = _ShardIndex.create_empty((2,))
+    index.set_chunk_slice((0,), slice(10, 20))
+    index.set_chunk_slice((1,), slice(10, 20))
+    with pytest.raises(ValueError, match=r"overlapping byte ranges"):
+        index.validate(data_section=(0, 100), allow_empty_chunks=False)
+
+
+def test_shard_index_validate_adjacent_is_not_overlap() -> None:
+    """Back-to-back chunks do not overlap."""
+    index = _ShardIndex.create_empty((2,))
+    index.set_chunk_slice((0,), slice(10, 20))
+    index.set_chunk_slice((1,), slice(20, 30))
+    index.validate(data_section=(0, 100), allow_empty_chunks=False)
+
+
+def test_shard_index_validate_zero_length_codec_contract() -> None:
+    """Zero-length payloads follow the codec contract, not the missing marker."""
+    index = _ShardIndex.create_empty((2,))
+    index.offsets_and_lengths[(1,)] = (10, 0)
+    # fixed-size inner chain: an empty encoding is impossible -> corrupt
+    with pytest.raises(ValueError, match="zero-length payload"):
+        index.validate(data_section=(0, 100), allow_empty_chunks=False)
+    # variable-size inner chain: an empty encoding is legitimate
+    index.validate(data_section=(0, 100), allow_empty_chunks=True)
+
+
+def test_shard_index_validate_zero_length_not_missing() -> None:
+    """A zero-length entry is not silently treated as a missing chunk."""
+    index = _ShardIndex.create_empty((2,))
+    index.offsets_and_lengths[(1,)] = (10, 0)
+    # out-of-section zero-length entries are still rejected
+    index.offsets_and_lengths[(0,)] = (200, 0)
+    with pytest.raises(ValueError, match="outside the shard's data section"):
+        index.validate(data_section=(0, 100), allow_empty_chunks=True)
+
+
+# ============================================================================
 # _load_partial_shard_maybe tests
 #
 # These exercise the partial-shard read path against a real MemoryStore wrapped

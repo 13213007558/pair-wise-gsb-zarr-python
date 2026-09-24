@@ -2,6 +2,7 @@ import enum
 import math
 import pickle
 import warnings
+from collections.abc import Callable
 from typing import Any, cast, get_args
 from unittest.mock import AsyncMock
 
@@ -14,6 +15,7 @@ import zarr.api
 import zarr.api.asynchronous
 from zarr import Array
 from zarr.abc.store import Store
+from zarr.abc.store import RangeByteRequest, SuffixByteRequest
 from zarr.codecs import (
     BloscCodec,
     BytesCodec,
@@ -33,6 +35,7 @@ from zarr.codecs.sharding import (
 from zarr.core.buffer import NDArrayLike, default_buffer_prototype
 from zarr.core.indexing import lexicographic_order_coords
 from zarr.core.metadata.v3 import ArrayV3Metadata
+from zarr.core.sync import sync
 from zarr.storage import MemoryStore, StorePath, ZipStore
 
 from ..conftest import ArrayRequest
@@ -1337,3 +1340,260 @@ def test_sharding_orthogonal_set_multiple_array_dims(
         expected[ix] = value.reshape(expected[ix].shape)
         assert np.array_equal(a[:], expected)
         assert np.array_equal(a.oindex[selection], value)
+
+
+# ============================================================================
+# Strict shard-index validation
+#
+# A valid index checksum says nothing about the offsets/lengths inside the
+# index. These tests corrupt a shard's index and re-encode it (recomputing
+# the checksum), then check that full reads, range partial reads, and partial
+# writes all reject the shard — and that a partial read raises before any
+# chunk-data range request is issued.
+# ============================================================================
+
+
+_CORRUPT_INDEX_KINDS = ["into_index", "beyond_shard", "half_marker", "overlap", "overflow"]
+
+
+def _make_two_chunk_shard_array(store: Store, index_location: IndexLocation) -> Array:
+    """One shard of two chunks, both written, for index-corruption tests."""
+    a = zarr.create_array(
+        StorePath(store),
+        shape=(16,),
+        chunks=(8,),
+        shards={"shape": (16,), "index_location": index_location},
+        dtype="int32",
+        compressors=None,
+        fill_value=-1,
+    )
+    a[:] = np.arange(16, dtype="int32")
+    return a
+
+
+def _shard_codec_of(a: Array) -> ShardingCodec:
+    codec = next(c for c in a.metadata.codecs if isinstance(c, ShardingCodec))
+    assert isinstance(codec, ShardingCodec)
+    return codec
+
+
+def _rewrite_shard_index(
+    store: Store,
+    key: str,
+    codec: ShardingCodec,
+    chunks_per_shard: tuple[int, ...],
+    mutate: Callable[[_ShardIndex, int, int], None],
+) -> None:
+    """Mutate a stored shard's index and write it back re-encoded.
+
+    The mutated index is re-encoded through the codec's index chain, so its
+    checksum is recomputed and valid: the shard can only be rejected because
+    of the index *contents*. `mutate` receives the decoded index, the shard
+    blob's byte length, and the encoded index size.
+    """
+    prototype = default_buffer_prototype()
+    shard_bytes = sync(store.get(key, prototype=prototype))
+    assert shard_bytes is not None
+    shard_nbytes = len(shard_bytes)
+    index_size = codec._shard_index_size(chunks_per_shard)
+    if codec.index_location == "start":
+        index_bytes = shard_bytes[:index_size]
+    else:
+        index_bytes = shard_bytes[shard_nbytes - index_size :]
+    index = codec._decode_shard_index_sync(index_bytes, chunks_per_shard)
+    # the decoded array may be a read-only view of the store's bytes
+    index = _ShardIndex(chunks_per_shard, index.offsets_and_lengths.copy())
+    mutate(index, shard_nbytes, index_size)
+    new_index_bytes = codec._encode_shard_index_sync(index)
+    template = prototype.buffer.create_zero_length()
+    if codec.index_location == "start":
+        new_blob = template.combine([new_index_bytes, shard_bytes[index_size:]])
+    else:
+        new_blob = template.combine(
+            [shard_bytes[: shard_nbytes - index_size], new_index_bytes]
+        )
+    sync(store.set(key, new_blob))
+
+
+def _index_corruptor(
+    kind: str, codec: ShardingCodec
+) -> Callable[[_ShardIndex, int, int], None]:
+    """Build a `mutate` for `_rewrite_shard_index` producing `kind` of corruption."""
+
+    def mutate(index: _ShardIndex, shard_nbytes: int, index_size: int) -> None:
+        if kind == "into_index":
+            # aim chunk (0,) at the index region itself
+            offset = 0 if codec.index_location == "start" else shard_nbytes - index_size
+            index.set_chunk_slice((0,), slice(offset, offset + 4))
+        elif kind == "beyond_shard":
+            # aim chunk (0,) past the end of the shard blob
+            index.set_chunk_slice((0,), slice(shard_nbytes, shard_nbytes + 4))
+        elif kind == "half_marker":
+            # missing marker in only one of the two fields
+            index.offsets_and_lengths[(0,)] = (MAX_UINT_64, 4)
+        elif kind == "overlap":
+            # chunk (1,) claims (a prefix of) the same bytes as chunk (0,)
+            start = int(index.offsets_and_lengths[(0,)][0])
+            index.set_chunk_slice((1,), slice(start, start + 4))
+        elif kind == "overflow":
+            # offset + length wraps around uint64
+            index.offsets_and_lengths[(0,)] = (2**64 - 10, 20)
+        else:
+            raise AssertionError(f"unknown corruption {kind!r}")
+
+    return mutate
+
+
+@pytest.mark.parametrize("index_location", ["start", "end"])
+@pytest.mark.parametrize("store", ["local", "memory"], indirect=["store"])
+@pytest.mark.parametrize("corruption", _CORRUPT_INDEX_KINDS)
+def test_sharding_corrupt_index_full_read_rejected(
+    store: Store, index_location: IndexLocation, corruption: str
+) -> None:
+    """A full-shard read rejects a malformed (but checksummed) index."""
+    a = _make_two_chunk_shard_array(store, index_location)
+    codec = _shard_codec_of(a)
+    _rewrite_shard_index(store, "c/0", codec, (2,), _index_corruptor(corruption, codec))
+
+    with pytest.raises(ValueError, match="Corrupt shard index"):
+        a[:]
+
+
+@pytest.mark.parametrize("index_location", ["start", "end"])
+@pytest.mark.parametrize("store", ["local", "memory"], indirect=["store"])
+@pytest.mark.parametrize("corruption", _CORRUPT_INDEX_KINDS)
+def test_sharding_corrupt_index_partial_read_rejected_before_data_reads(
+    store: Store, index_location: IndexLocation, corruption: str
+) -> None:
+    """A range partial read rejects a malformed index before any data fetch.
+
+    The store mock records every request: the corrupt index must be detected
+    after the index fetch but before any chunk-data range request, so a
+    corrupt index can never make a partial read request the index region or
+    bytes beyond the shard.
+    """
+    store_mock = AsyncMock(wraps=store, spec=store.__class__)
+    a = _make_two_chunk_shard_array(store_mock, index_location)
+    codec = _shard_codec_of(a)
+    _rewrite_shard_index(store, "c/0", codec, (2,), _index_corruptor(corruption, codec))
+
+    store_mock.reset_mock()  # ignore store calls during creation and corruption
+
+    # a partial read that needs chunk (0,) of the shard
+    with pytest.raises(ValueError, match="Corrupt shard index"):
+        a[0:4]
+
+    # no chunk-data range request was issued
+    assert _range_read_count(store_mock) == 0
+
+
+@pytest.mark.parametrize("index_location", ["start", "end"])
+@pytest.mark.parametrize("store", ["local", "memory"], indirect=["store"])
+@pytest.mark.parametrize("corruption", _CORRUPT_INDEX_KINDS)
+def test_sharding_corrupt_index_partial_write_rejected(
+    store: Store, index_location: IndexLocation, corruption: str
+) -> None:
+    """A partial write rejects the existing shard's malformed index."""
+    a = _make_two_chunk_shard_array(store, index_location)
+    codec = _shard_codec_of(a)
+    _rewrite_shard_index(store, "c/0", codec, (2,), _index_corruptor(corruption, codec))
+
+    with pytest.raises(ValueError, match="Corrupt shard index"):
+        a[0] = 5
+
+
+@pytest.mark.parametrize("index_location", ["start", "end"])
+@pytest.mark.parametrize("store", ["local", "memory"], indirect=["store"])
+def test_sharding_corrupt_index_overlap_error_names_both_chunks(
+    store: Store, index_location: IndexLocation
+) -> None:
+    """The overlap error reports the coordinates of both sub-chunks."""
+    a = _make_two_chunk_shard_array(store, index_location)
+    codec = _shard_codec_of(a)
+    _rewrite_shard_index(store, "c/0", codec, (2,), _index_corruptor("overlap", codec))
+
+    with pytest.raises(ValueError, match=r"overlapping byte ranges") as exc_info:
+        a[:]
+    assert "(0,)" in str(exc_info.value)
+    assert "(1,)" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("index_location", ["start", "end"])
+@pytest.mark.parametrize("store", ["local", "memory"], indirect=["store"])
+def test_sharding_zero_length_chunk_entry_rejected_for_fixed_size_codecs(
+    store: Store, index_location: IndexLocation
+) -> None:
+    """A zero-length index entry is corrupt when the inner chain is fixed-size."""
+    a = _make_two_chunk_shard_array(store, index_location)
+    codec = _shard_codec_of(a)
+
+    def zero_length(index: _ShardIndex, shard_nbytes: int, index_size: int) -> None:
+        # an in-section offset, but an empty payload
+        offset = index_size if codec.index_location == "start" else 0
+        index.offsets_and_lengths[(0,)] = (offset, 0)
+
+    _rewrite_shard_index(store, "c/0", codec, (2,), zero_length)
+    with pytest.raises(ValueError, match="zero-length payload"):
+        a[:]
+
+
+def test_sharding_validate_index_zero_length_allowed_for_variable_size_codecs() -> None:
+    """A zero-length payload is legitimate when the codec chain permits it.
+
+    A variable-size inner chain (e.g. a compressor) may legitimately encode a
+    chunk to zero bytes, so the empty payload is not treated as corruption —
+    nor as the missing marker.
+    """
+    codec = ShardingCodec(chunk_shape=(8,), codecs=(BloscCodec(),))
+    index = _ShardIndex.create_empty((2,))
+    index.offsets_and_lengths[(0,)] = (0, 0)
+    index.set_chunk_slice((1,), slice(0, 8))
+    codec._validate_shard_index(index, shard_nbytes=8 + codec._shard_index_size((2,)))
+
+    fixed_codec = ShardingCodec(chunk_shape=(8,), codecs=(BytesCodec(),))
+    with pytest.raises(ValueError, match="zero-length payload"):
+        fixed_codec._validate_shard_index(
+            index, shard_nbytes=8 + fixed_codec._shard_index_size((2,))
+        )
+
+
+@pytest.mark.parametrize("index_location", ["start", "end"])
+@pytest.mark.parametrize("store", ["local", "memory", "zip"], indirect=["store"])
+def test_sharding_partial_read_sparse_shard_read_overhead(
+    store: Store, index_location: IndexLocation
+) -> None:
+    """Strict validation keeps sparse partial reads proportional to the index.
+
+    The read must cost one index-sized fetch plus the touched chunk ranges —
+    never a whole-shard read.
+    """
+    store_mock = AsyncMock(wraps=store, spec=store.__class__)
+    a = zarr.create_array(
+        StorePath(store_mock),
+        shape=(16,),
+        chunks=(4,),
+        shards={"shape": (16,), "index_location": index_location},
+        dtype="int32",
+        compressors=None,
+        fill_value=-1,
+    )
+    a[8:12] = np.arange(4, dtype="int32")  # write only chunk (2,) of the shard
+
+    store_mock.reset_mock()  # ignore store calls during array creation
+
+    assert np.array_equal(a[8:12], np.arange(4, dtype="int32"))
+
+    # exactly one index fetch, sized like the index
+    get_method = store_mock.get_sync if _reads_are_sync(store_mock) else store_mock.get
+    assert get_method.call_count == 1
+    codec = _shard_codec_of(a)
+    index_size = codec._shard_index_size((4,))
+    byte_range = get_method.call_args.kwargs["byte_range"]
+    if index_location == "start":
+        assert byte_range == RangeByteRequest(0, index_size)
+    else:
+        assert byte_range == SuffixByteRequest(index_size)
+    # chunk data came from coalesced range reads, never a whole-shard fetch
+    assert _range_read_count(store_mock) == 1
+    for call in get_method.call_args_list:
+        assert call.kwargs["byte_range"] is not None

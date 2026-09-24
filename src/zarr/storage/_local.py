@@ -411,3 +411,8 @@ class LocalStore(Store):
 
     async def getsize(self, key: str) -> int:
         return (self.root / key).stat().st_size
+
+    def getsize_sync(self, key: str) -> int:
+        """Synchronous counterpart of `getsize`."""
+        self._ensure_open_sync()
+        return (self.root / key).stat().st_size

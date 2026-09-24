@@ -347,6 +347,17 @@ class ZipStore(Store):
             else:
                 return True
 
+    async def getsize(self, key: str) -> int:
+        # Cheap override: the base implementation reads the whole value,
+        # while the zip directory already knows every member's size.
+        if not self._is_open:
+            self._sync_open()
+        with self._lock:
+            try:
+                return self._zf.getinfo(key).file_size
+            except KeyError:
+                raise FileNotFoundError(key) from None
+
     async def list(self) -> AsyncIterator[str]:
         # docstring inherited
         if not self._is_open:

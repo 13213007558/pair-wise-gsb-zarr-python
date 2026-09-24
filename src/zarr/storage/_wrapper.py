@@ -141,6 +141,18 @@ class WrapperStore[T_Store: Store](Store):
     async def set(self, key: str, value: Buffer) -> None:
         await self._store.set(key, value)
 
+    async def getsize(self, key: str) -> int:
+        return await self._store.getsize(key)
+
+    def getsize_sync(self, key: str) -> int:
+        """Forward `getsize_sync` to the wrapped store, when it offers one."""
+        getsize_sync = getattr(self._store, "getsize_sync", None)
+        if getsize_sync is None:
+            raise NotImplementedError(
+                f"Store {type(self._store).__name__} does not offer getsize_sync."
+            )
+        return getsize_sync(key)
+
     async def set_if_not_exists(self, key: str, value: Buffer) -> None:
         return await self._store.set_if_not_exists(key, value)
 

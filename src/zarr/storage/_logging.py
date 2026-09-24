@@ -252,6 +252,11 @@ class LoggingStore[T_Store: Store](WrapperStore[T_Store]):
         with self.log(key):
             return await self._store.getsize(key)
 
+    def getsize_sync(self, key: str) -> int:
+        # docstring inherited
+        with self.log(key):
+            return super().getsize_sync(key)
+
     async def getsize_prefix(self, prefix: str) -> int:
         with self.log(prefix):
             return await self._store.getsize_prefix(prefix)
