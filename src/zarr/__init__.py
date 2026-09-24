@@ -27,6 +27,7 @@ from zarr.api.synchronous import (
     open_consolidated,
     open_group,
     open_like,
+    rechunk,
     save,
     save_array,
     save_group,
@@ -37,6 +38,7 @@ from zarr.api.synchronous import (
 from zarr.core.array import Array, AsyncArray
 from zarr.core.config import config
 from zarr.core.group import AsyncGroup, Group
+from zarr.core.rechunk import rechunk_is_complete
 
 # in case setuptools scm screw up and find version to be 0.0.0
 if __version__.startswith("0.0.0"):
@@ -176,6 +178,8 @@ __all__ = [
     "open_group",
     "open_like",
     "print_debug_info",
+    "rechunk",
+    "rechunk_is_complete",
     "save",
     "save_array",
     "save_group",

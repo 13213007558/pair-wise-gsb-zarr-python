@@ -66,6 +66,7 @@ __all__ = [
     "open_consolidated",
     "open_group",
     "open_like",
+    "rechunk",
     "save",
     "save_array",
     "save_group",
@@ -134,6 +135,90 @@ def copy_store(*args: Any, **kwargs: Any) -> tuple[int, int, int]:
     Not implemented.
     """
     return sync(async_api.copy_store(*args, **kwargs))
+
+
+def rechunk(
+    source: AnyArray,
+    chunks: int | tuple[int, ...],
+    max_mem: int,
+    *,
+    shards: int | tuple[int, ...] | None = None,
+    filters: FiltersLike | Literal["keep"] = "keep",
+    compressors: CompressorsLike | Literal["keep"] = "keep",
+    serializer: SerializerLike | Literal["keep"] = "keep",
+    store: StoreLike | None = None,
+    name: str | None = None,
+    overwrite: bool = False,
+    storage_options: dict[str, Any] | None = None,
+    config: ArrayConfigLike | None = None,
+) -> AnyArray:
+    """Copy an existing array into a new array with a different chunk layout.
+
+    The new array keeps the source's shape, dtype, fill value, and values;
+    only the chunk grid (and optionally the shard grid and the codecs) change.
+    The copy is planned so that the decoded working memory never exceeds
+    ``max_mem`` bytes: the array is processed in rectangular units made of
+    whole target write chunks, grown to fit the budget, and a ``ValueError``
+    is raised before anything is written when even one source chunk plus one
+    target chunk cannot fit in ``max_mem``.  Note that ``max_mem`` is a memory
+    budget in bytes, not a number of concurrent tasks.
+
+    Parameters
+    ----------
+    source : Array
+        The array to copy.  It is only read, never modified or deleted;
+        deleting the old array after a successful copy is deliberately not
+        part of this interface.
+    chunks : int or tuple[int, ...]
+        Chunk shape of the new array.  An int is broadcast to every dimension.
+    max_mem : int
+        Maximum decoded working memory in bytes.
+    shards : int or tuple[int, ...], optional
+        Shard shape of the new array.  Each entry must be a multiple of the
+        corresponding ``chunks`` entry.  The default of ``None`` creates an
+        unsharded array.
+    filters, compressors, serializer : "keep" or codec specification, optional
+        Codec configuration of the new array.  ``"keep"`` (the default)
+        retains the source's configuration; pass any value accepted by
+        :func:`create_array` to change it, e.g. a different compressor.
+    store : StoreLike, optional
+        Destination store.  Defaults to a new in-memory store.
+    name : str, optional
+        Path of the new array within ``store``.
+    overwrite : bool, default False
+        Whether to overwrite an existing array at the destination.
+    storage_options : dict, optional
+        Passed to the store constructor when ``store`` is a URL.
+    config : ArrayConfigLike, optional
+        Runtime configuration for the new array.
+
+    Returns
+    -------
+    Array
+        The newly created array.  Regions of pure fill value are not
+        materialized as stored chunks.  If the copy fails partway, the target
+        left behind is recognizable as incomplete: its ``_rechunk_complete``
+        attribute is only ``True`` after every value has been copied (see
+        :func:`zarr.core.rechunk.rechunk_is_complete`).
+    """
+    return Array(
+        sync(
+            async_api.rechunk(
+                source,
+                chunks,
+                max_mem,
+                shards=shards,
+                filters=filters,
+                compressors=compressors,
+                serializer=serializer,
+                store=store,
+                name=name,
+                overwrite=overwrite,
+                storage_options=storage_options,
+                config=config,
+            )
+        )
+    )
 
 
 def load(

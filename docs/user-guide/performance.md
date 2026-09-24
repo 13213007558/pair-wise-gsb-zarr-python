@@ -190,10 +190,32 @@ objects at all.
 
 ### Changing chunk shapes (rechunking)
 
-Zarr-Python does not yet provide a built-in way to change the chunk shape of an
-existing array in place. Arrays can, however, be resized and appended to along any
-dimension — see [Resizing and appending](arrays.md#resizing-and-appending) — and data
-can be copied to a new array created with the desired chunk shape.
+Use [`zarr.rechunk`][zarr.rechunk] to copy an existing array into a new array
+with a different chunk (and optionally shard) layout. The copy is planned
+against a decoded-memory budget supplied by the caller, so peak memory stays
+bounded even when the source and target chunk shapes do not divide each
+other:
+
+```python exec="true" session="perf-rechunk" source="above"
+import zarr
+import numpy as np
+
+store = {}
+source = zarr.create_array(store, shape=(1000, 1000), chunks=(170, 110), dtype="i4")
+source[:] = np.arange(1000 * 1000, dtype="i4").reshape(1000, 1000)
+
+# copy to a new chunk layout, allowing at most 1 MiB of decoded working memory
+target = zarr.rechunk(source, (80, 230), max_mem=1 << 20)
+print(target.chunks, zarr.rechunk_is_complete(target))
+```
+
+The target keeps the source's shape, dtype, fill value, and values; the
+compressor (and other codecs) can be changed via the `compressors` parameter.
+If even one source chunk plus one target chunk does not fit in `max_mem`,
+`zarr.rechunk` raises a `ValueError` before writing anything. A target left
+behind by a failed copy is recognizable as incomplete via
+[`zarr.rechunk_is_complete`][zarr.rechunk_is_complete]. The source array is
+left in place; deleting it after a successful copy is up to the caller.
 
 ## Parallel computing and synchronization
 
