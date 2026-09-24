@@ -371,6 +371,29 @@ print(z[1, [1, 3]])
 print(z[[1, 1], [1, 3]])
 ```
 
+### Merging sparse updates
+
+When a batch of updates arrives as coordinates plus values — e.g. sensor
+readings that may contain repeated coordinates — the
+[`zarr.Array.scatter_reduce`][] method merges the whole batch into the array
+in a single call. The `op` argument selects how each batch value is combined
+with the stored value: `"add"` adds it, while `"min"` and `"max"` keep the
+smaller/larger of the two. If a coordinate appears multiple times in one
+call, its batch values are first combined with each other and the result is
+then combined with the stored value, so every update is applied exactly once
+regardless of ordering (unlike `set_coordinate_selection`, where duplicate
+coordinates are last-write-wins):
+
+```python exec="true" session="arrays" source="above" result="ansi"
+z = zarr.create_array(store='data/example-12.zarr', shape=(5,), dtype='i4', overwrite=True)
+z.scatter_reduce(([0, 1, 1, 3],), [1, 2, 3, 4], op="add")
+print(z[:])
+```
+
+Each touched chunk is read and written back once per call, no matter how many
+selected points fall into it. Note that correctness is only guaranteed for a
+single call: concurrent writers updating the same chunk are not coordinated.
+
 ### Indexing with a mask array
 
 Items can also be extracted by providing a Boolean mask. E.g.:

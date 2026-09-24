@@ -57,6 +57,7 @@ from zarr.core.chunk_key_encodings import (
     V2ChunkKeyEncoding,
     parse_chunk_key_encoding,
 )
+from zarr.core.chunk_utils import chunk_is_empty, fill_value_or_default
 from zarr.core.common import (
     JSON,
     ZARR_JSON,
@@ -1682,6 +1683,77 @@ class AsyncArray[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
             self._chunk_grid,
             selection,
             value,
+            prototype=prototype,
+        )
+
+    async def scatter_reduce(
+        self,
+        selection: CoordinateSelection,
+        value: npt.ArrayLike,
+        *,
+        op: ScatterOp,
+        prototype: BufferPrototype | None = None,
+    ) -> None:
+        """Merge a batch of sparse updates into the array in a single call.
+
+        Each selected point is combined with its stored value using the given
+        op: "add" adds the batch value to the stored value, while "min" and
+        "max" keep the smaller/larger of the two. When the same coordinate
+        appears multiple times in the selection, the batch values for that
+        coordinate are first combined with each other and the result is then
+        combined with the stored value, so every update in the batch is
+        applied exactly once regardless of ordering.
+
+        Updates are grouped by chunk: each touched chunk is read, merged and
+        written back once per call, no matter how many selected points fall
+        into it (this also holds for sharded arrays, where points landing in
+        the same inner chunk trigger a single shard rewrite).
+
+        Parameters
+        ----------
+        selection : tuple
+            An integer (coordinate) array for each dimension of the array.
+            Negative indices are supported and coordinates may be given in
+            any order.
+        value : npt.ArrayLike
+            One value per selected point, or a scalar to broadcast to all
+            selected points. The value dtype must be safely convertible to
+            the array dtype.
+        op : {"add", "min", "max"}
+            The reduction used to combine batch values with stored values.
+        prototype : BufferPrototype or None, optional
+            A prototype buffer that defines the structure and properties of
+            the array chunks being modified. If None, the default buffer
+            prototype is used.
+
+        Notes
+        -----
+        All validation (out-of-bounds coordinates, unsafe dtype conversion,
+        value shape mismatch) happens before any chunk is written, so a
+        rejected call leaves the store untouched.
+
+        Correctness is only guaranteed for a single call. Concurrent calls
+        (e.g. from multiple processes) writing the same chunk are not
+        coordinated and may lose updates.
+
+        See Also
+        --------
+        [set_coordinate_selection][zarr.Array.set_coordinate_selection] :
+            overwrite instead of merge; duplicate coordinates are
+            last-write-wins.
+        """
+        if prototype is None:
+            prototype = default_buffer_prototype()
+        indexer = CoordinateIndexer(selection, self.metadata.shape, self._chunk_grid)
+        return await _scatter_selection(
+            self.store_path,
+            self.metadata,
+            self.codec_pipeline,
+            self.config,
+            self._chunk_grid,
+            indexer,
+            value,
+            op=op,
             prototype=prototype,
         )
 
@@ -3671,6 +3743,85 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
             )
 
         sync(self.async_array._set_selection(indexer, value, fields=fields, prototype=prototype))
+
+    def scatter_reduce(
+        self,
+        selection: CoordinateSelection,
+        value: npt.ArrayLike,
+        *,
+        op: ScatterOp,
+        prototype: BufferPrototype | None = None,
+    ) -> None:
+        """Merge a batch of sparse updates into the array in a single call.
+
+        Each selected point is combined with its stored value using the given
+        op: "add" adds the batch value to the stored value, while "min" and
+        "max" keep the smaller/larger of the two. When the same coordinate
+        appears multiple times in the selection, the batch values for that
+        coordinate are first combined with each other and the result is then
+        combined with the stored value, so every update in the batch is
+        applied exactly once regardless of ordering.
+
+        Updates are grouped by chunk: each touched chunk is read, merged and
+        written back once per call, no matter how many selected points fall
+        into it (this also holds for sharded arrays, where points landing in
+        the same inner chunk trigger a single shard rewrite).
+
+        Parameters
+        ----------
+        selection : tuple
+            An integer (coordinate) array for each dimension of the array.
+            Negative indices are supported and coordinates may be given in
+            any order.
+        value : npt.ArrayLike
+            One value per selected point, or a scalar to broadcast to all
+            selected points. The value dtype must be safely convertible to
+            the array dtype.
+        op : {"add", "min", "max"}
+            The reduction used to combine batch values with stored values.
+        prototype : BufferPrototype or None, optional
+            A prototype buffer that defines the structure and properties of
+            the array chunks being modified. If None, the default buffer
+            prototype is used.
+
+        Examples
+        --------
+        Setup a 1-dimensional array:
+
+            >>> import zarr
+            >>> z = zarr.zeros(shape=(5,), store={}, chunk_shape=(2,), dtype="i4")
+
+        Add a batch of sensor readings, some sharing the same coordinate:
+
+            >>> z.scatter_reduce(([0, 1, 1, 3],), [1, 2, 3, 4], op="add")
+            >>> z[:]
+            array([1, 5, 0, 4, 0], dtype=int32)
+
+        Repeated updates accumulate across calls:
+
+            >>> z.scatter_reduce(([1, 3],), 1, op="add")
+            >>> z[:]
+            array([1, 6, 0, 5, 0], dtype=int32)
+
+        Notes
+        -----
+        All validation (out-of-bounds coordinates, unsafe dtype conversion,
+        value shape mismatch) happens before any chunk is written, so a
+        rejected call leaves the store untouched.
+
+        Correctness is only guaranteed for a single call. Concurrent calls
+        (e.g. from multiple processes) writing the same chunk are not
+        coordinated and may lose updates.
+
+        See Also
+        --------
+        [set_coordinate_selection][zarr.Array.set_coordinate_selection] :
+            overwrite instead of merge; duplicate coordinates are
+            last-write-wins.
+        """
+        if prototype is None:
+            prototype = default_buffer_prototype()
+        sync(self.async_array.scatter_reduce(selection, value, op=op, prototype=prototype))
 
     def get_block_selection(
         self,
@@ -5824,6 +5975,191 @@ async def _set_selection(
         ],
         value_buffer,
         drop_axes=indexer.drop_axes,
+    )
+
+
+_SCATTER_OPS: dict[str, np.ufunc] = {
+    "add": np.add,
+    "min": np.minimum,
+    "max": np.maximum,
+}
+
+ScatterOp = Literal["add", "min", "max"]
+
+
+def _normalize_scatter_value(
+    value: npt.ArrayLike, dtype: np.dtype[Any], selection_size: tuple[int, ...]
+) -> npt.NDArray[Any]:
+    """Validate and normalize the value for a scatter-reduce call.
+
+    All checks run before any chunk is read or written, so a failure here
+    guarantees the store is left untouched. Returns a flat array of the
+    array's native dtype with one value per selected point (scalars are
+    broadcast).
+    """
+    value_arr = np.asarray(value)
+    if not np.can_cast(value_arr.dtype, dtype, casting="same_kind"):
+        raise TypeError(
+            f"cannot safely cast scatter value of dtype {value_arr.dtype} to array dtype {dtype}"
+        )
+    if value_arr.dtype.kind in "iu" and dtype.kind in "iu" and value_arr.size > 0:
+        # same_kind casting allows e.g. int64 -> int32; reject values that
+        # would not fit in the target dtype.
+        info = np.iinfo(dtype)
+        if int(value_arr.min()) < info.min or int(value_arr.max()) > info.max:
+            raise TypeError(
+                f"scatter value contains integers outside the range of array dtype {dtype}"
+            )
+    value_arr = np.asarray(value_arr, dtype=dtype)
+    if value_arr.shape == ():
+        # scalar broadcast: one value applied to every selected point
+        return np.full(selection_size, value_arr, dtype=dtype)
+    value_arr = value_arr.reshape(-1)
+    if value_arr.shape != selection_size:
+        raise ValueError(
+            f"attempting to scatter {value_arr.size} values into a selection of "
+            f"{product(selection_size)} points"
+        )
+    return value_arr
+
+
+async def _scatter_selection(
+    store_path: StorePath,
+    metadata: ArrayMetadata,
+    codec_pipeline: CodecPipeline,
+    config: ArrayConfig,
+    chunk_grid: ChunkGrid,
+    indexer: CoordinateIndexer,
+    value: npt.ArrayLike,
+    *,
+    op: ScatterOp,
+    prototype: BufferPrototype,
+) -> None:
+    """Merge values into an array at the coordinates given by the indexer.
+
+    Duplicate coordinates within the batch are first combined with each other
+    using the scatter op and the result is then combined with the existing
+    stored value, so every update in the batch is applied exactly once.
+    Updates are grouped by chunk: each touched chunk is read, merged and
+    written once per call, no matter how many selected points fall into it.
+
+    All validation (bounds, dtype conversion, value shape) happens before any
+    chunk is written, so a rejected call leaves the store untouched.
+
+    Correctness is only guaranteed for a single call; concurrent calls writing
+    the same chunk are not coordinated.
+    """
+    try:
+        ufunc = _SCATTER_OPS[op]
+    except KeyError:
+        raise ValueError(
+            f"invalid scatter op {op!r}; expected one of {sorted(_SCATTER_OPS)}"
+        ) from None
+
+    # The dtype attribute returns the zarr dtype object for both v2 and v3 metadata.
+    zdtype = metadata.dtype
+    dtype = zdtype.to_native_dtype()
+
+    if op in ("min", "max") and dtype.kind == "c":
+        raise TypeError(f"scatter op {op!r} is not defined for complex dtype {dtype}")
+
+    # Validate and normalize the value up front, before any store IO, so that
+    # a rejected call cannot leave partially written chunks behind.
+    value = _normalize_scatter_value(value, dtype, indexer.shape)
+    value_buffer = prototype.nd_buffer.from_ndarray_like(value)
+
+    # need to use the order from the metadata for v2
+    _config = config
+    if metadata.zarr_format == 2:
+        _config = replace(_config, order=metadata.order)
+
+    indexed_chunks = list(indexer)
+    if not indexed_chunks:
+        return
+
+    # For regular grids, all chunks share the same ArraySpec, so build it once
+    # and reuse it to avoid per-chunk ChunkGrid lookups and ArraySpec construction.
+    regular_grid = chunk_grid.is_regular
+    if regular_grid:
+        regular_chunk_spec = ArraySpec(
+            shape=chunk_grid.chunk_shape,
+            dtype=metadata.dtype,
+            fill_value=metadata.fill_value,
+            config=_config,
+            prototype=prototype,
+        )
+    batch = [
+        (
+            store_path / metadata.encode_chunk_key(chunk_coords),
+            regular_chunk_spec
+            if regular_grid
+            else _get_chunk_spec(metadata, chunk_grid, chunk_coords, _config, prototype),
+            chunk_selection,
+            out_selection,
+        )
+        for chunk_coords, chunk_selection, out_selection, _ in indexed_chunks
+    ]
+
+    async def _read_key(byte_getter: StorePath, prototype: BufferPrototype) -> Buffer | None:
+        return await byte_getter.get(prototype=prototype)
+
+    chunk_bytes_batch = await concurrent_map(
+        [(byte_getter, chunk_spec.prototype) for byte_getter, chunk_spec, *_ in batch],
+        _read_key,
+        zarr_config.get("async.concurrency"),
+    )
+    chunk_array_decoded = await codec_pipeline.decode(
+        [
+            (chunk_bytes, chunk_spec)
+            for chunk_bytes, (_, chunk_spec, *_) in zip(chunk_bytes_batch, batch, strict=False)
+        ],
+    )
+
+    # Merge each chunk in memory. ufunc.at applies every selected point, so
+    # repeated coordinates within the chunk are all combined (never
+    # last-write-wins), and the merge with the pre-existing chunk contents
+    # happens in the same pass.
+    chunk_array_merged: list[NDBuffer | None] = []
+    for chunk_array, (_, chunk_spec, chunk_selection, out_selection) in zip(
+        chunk_array_decoded, batch, strict=True
+    ):
+        if chunk_array is None:
+            chunk_array = chunk_spec.prototype.nd_buffer.create(
+                shape=chunk_spec.shape,
+                dtype=chunk_spec.dtype.to_native_dtype(),
+                order=chunk_spec.order,
+                fill_value=fill_value_or_default(chunk_spec),
+            )
+        else:
+            chunk_array = chunk_array.copy()
+        chunk_values = value_buffer[out_selection].as_ndarray_like()
+        chunk_np = cast("npt.NDArray[Any]", chunk_array.as_ndarray_like())
+        # a CoordinateIndexer always yields per-dimension integer index arrays
+        chunk_coords = cast("tuple[npt.NDArray[np.intp], ...]", chunk_selection)
+        ufunc.at(chunk_np, chunk_coords, chunk_values)
+        merged = chunk_spec.prototype.nd_buffer.from_ndarray_like(chunk_np)
+        chunk_array_merged.append(None if chunk_is_empty(merged, chunk_spec) else merged)
+
+    chunk_bytes_encoded = await codec_pipeline.encode(
+        [
+            (chunk_array, chunk_spec)
+            for chunk_array, (_, chunk_spec, *_) in zip(chunk_array_merged, batch, strict=False)
+        ],
+    )
+
+    async def _write_key(byte_setter: StorePath, chunk_bytes: Buffer | None) -> None:
+        if chunk_bytes is None:
+            await byte_setter.delete()
+        else:
+            await byte_setter.set(chunk_bytes)
+
+    await concurrent_map(
+        [
+            (byte_setter, chunk_bytes)
+            for chunk_bytes, (byte_setter, *_) in zip(chunk_bytes_encoded, batch, strict=False)
+        ],
+        _write_key,
+        zarr_config.get("async.concurrency"),
     )
 
 
