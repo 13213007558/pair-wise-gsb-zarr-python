@@ -100,6 +100,7 @@ from zarr.core.indexing import (
     OIndex,
     OrthogonalIndexer,
     OrthogonalSelection,
+    ScatterOp,
     Selection,
     VIndex,
     _iter_grid,
@@ -1634,6 +1635,44 @@ class AsyncArray[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
             prototype=prototype,
             fields=fields,
         )
+
+    async def _scatter(
+        self,
+        indexer: CoordinateIndexer,
+        values: npt.ArrayLike,
+        *,
+        op: ScatterOp,
+        prototype: BufferPrototype,
+    ) -> None:
+        return await _scatter(
+            self.store_path,
+            self.metadata,
+            self.codec_pipeline,
+            self.config,
+            self._chunk_grid,
+            indexer,
+            values,
+            op=op,
+            prototype=prototype,
+        )
+
+    async def scatter(
+        self,
+        selection: CoordinateSelection,
+        values: npt.ArrayLike,
+        *,
+        op: ScatterOp,
+        prototype: BufferPrototype | None = None,
+    ) -> None:
+        """Asynchronously combine values into the array at individual coordinates.
+
+        This is the asynchronous variant of [scatter][zarr.Array.scatter]; see
+        that method for full documentation.
+        """
+        if prototype is None:
+            prototype = default_buffer_prototype()
+        indexer = _scatter_indexer(selection, self.shape, self._chunk_grid)
+        return await self._scatter(indexer, values, op=op, prototype=prototype)
 
     async def setitem(
         self,
@@ -3671,6 +3710,90 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
             )
 
         sync(self.async_array._set_selection(indexer, value, fields=fields, prototype=prototype))
+
+    def scatter(
+        self,
+        selection: CoordinateSelection,
+        values: npt.ArrayLike,
+        *,
+        op: ScatterOp,
+        prototype: BufferPrototype | None = None,
+    ) -> None:
+        """Combine values into the array at individual coordinates, in a single call.
+
+        This is a vectorized "scatter" operation in the style of the NumPy
+        ufunc 'at' method (e.g. 'np.add.at'): one value per coordinate is
+        combined with the current array contents using the requested operation.
+        Unlike plain coordinate assignment ('vindex[...] = ...'), repeated
+        coordinates are not overwritten but merged: all updates in the batch
+        are first combined with each other using 'op' and then combined with
+        the existing array values, so no update is lost regardless of how the
+        coordinates are ordered or grouped.
+
+        Parameters
+        ----------
+        selection : tuple
+            An integer (coordinate) array for each dimension of the array.
+            Coordinates may be unordered and may contain negative indices,
+            which are interpreted as offsets from the end of the dimension.
+            Coordinate arrays are broadcast against each other as for
+            coordinate (point) selection.
+        values : npt.ArrayLike
+            The values to combine into the array. A scalar is broadcast to all
+            coordinates; otherwise the values must be broadcastable to the
+            shape of the coordinate selection (or provide exactly one value
+            per coordinate).
+        op : {"add", "min", "max"}
+            How to combine values with existing data: elementwise sum
+            ("add"), minimum ("min"), or maximum ("max").
+        prototype : BufferPrototype or None, optional
+            A prototype buffer that defines the structure and properties of
+            the array chunks being modified. If None, the default buffer
+            prototype is used.
+
+        Notes
+        -----
+        All coordinates are validated, and all affected chunks are read and
+        merged in memory, before anything is written. If a coordinate is out
+        of bounds, or the values cannot be cast to the array dtype under the
+        same rules NumPy applies to in-place operations (e.g. 'a[i] += x'),
+        an exception is raised and no chunk is modified.
+
+        Updates touching the same chunk (or shard, for sharded arrays) are
+        applied together, so each affected chunk is read and written at most
+        once per call. Correctness is only guaranteed for a single call; no
+        coordination is provided for multiple processes concurrently writing
+        the same chunk.
+
+        Examples
+        --------
+        Setup a 1-dimensional array:
+
+            >>> import zarr
+            >>> z = zarr.zeros(shape=(5,), store={}, chunk_shape=(2,), dtype="i4")
+
+        Add values at coordinates, with a repeated coordinate:
+
+            >>> z.scatter(([0, 0, 3],), [1, 2, 10], op="add")
+            >>> z[...]
+            array([ 3,  0,  0, 10,  0], dtype=int32)
+
+        The same operations are available via 'vindex':
+
+            >>> z.vindex.add([4, 0], [5, 1])
+            >>> z.vindex.max([1], 7)
+            >>> z[...]
+            array([ 4,  7,  0, 10,  5], dtype=int32)
+
+        See Also
+        --------
+        [set_coordinate_selection][zarr.Array.set_coordinate_selection],
+        [vindex][zarr.Array.vindex]
+        """
+        if prototype is None:
+            prototype = default_buffer_prototype()
+        indexer = _scatter_indexer(selection, self.shape, self._chunk_grid)
+        sync(self.async_array._scatter(indexer, values, op=op, prototype=prototype))
 
     def get_block_selection(
         self,
@@ -5827,6 +5950,29 @@ async def _set_selection(
     )
 
 
+_SCATTER_UFUNCS: dict[ScatterOp, np.ufunc] = {
+    "add": np.add,
+    "min": np.minimum,
+    "max": np.maximum,
+}
+
+
+def _scatter_indexer(
+    selection: CoordinateSelection,
+    shape: tuple[int, ...],
+    chunk_grid: ChunkGrid,
+) -> CoordinateIndexer:
+    """Validate a scatter selection and build its coordinate indexer.
+
+    The indexer constructor normalizes negative indices and raises IndexError
+    for out-of-bounds coordinates, before anything is read from the store.
+    """
+    fields, new_selection = pop_fields(selection)
+    if fields:
+        raise IndexError("'fields' argument is not supported for scatter operations")
+    return CoordinateIndexer(cast("CoordinateSelection", new_selection), shape, chunk_grid)
+
+
 async def _setitem(
     store_path: StorePath,
     metadata: ArrayMetadata,
@@ -6054,4 +6200,201 @@ async def _info_complete(
     return array._info(
         await _nshards_initialized(array),
         await array.store_path.store.getsize_prefix(array.store_path.path),
+    )
+
+
+async def _scatter(
+    store_path: StorePath,
+    metadata: ArrayMetadata,
+    codec_pipeline: CodecPipeline,
+    config: ArrayConfig,
+    chunk_grid: ChunkGrid,
+    indexer: CoordinateIndexer,
+    values: npt.ArrayLike,
+    *,
+    op: ScatterOp,
+    prototype: BufferPrototype,
+) -> None:
+    """
+    Combine values into an array at individual coordinates, in a single call.
+
+    Parameters
+    ----------
+    store_path : StorePath
+        The store path of the array.
+    metadata : ArrayMetadata
+        The array metadata.
+    codec_pipeline : CodecPipeline
+        The codec pipeline for encoding/decoding.
+    config : ArrayConfig
+        The array configuration.
+    chunk_grid : ChunkGrid
+        The chunk grid.
+    indexer : CoordinateIndexer
+        The indexer specifying the coordinates to update.
+    values : npt.ArrayLike
+        The values to combine into the array.
+    op : {"add", "min", "max"}
+        The aggregation used to combine values with existing data.
+    prototype : BufferPrototype
+        A buffer prototype to use.
+
+    Notes
+    -----
+    Every touched chunk is read in full and merged in memory before any chunk
+    is written, so validation or merge errors leave the store untouched. Each
+    touched chunk (a whole shard, for sharded arrays) is read and written at
+    most once.
+    """
+    try:
+        ufunc = _SCATTER_UFUNCS[op]
+    except KeyError:
+        raise ValueError(
+            f"invalid scatter operation {op!r}; expected one of {sorted(_SCATTER_UFUNCS)}"
+        ) from None
+
+    # 'dtype' returns the zarr dtype object for both v2 and v3 metadata.
+    zdtype = metadata.dtype
+    dtype = zdtype.to_native_dtype()
+
+    # Normalize values to a 1-D array aligned with the flattened coordinate
+    # selection. Scalars and arrays broadcastable to the selection shape are
+    # accepted, as is any array providing exactly one value per coordinate.
+    npoints = product(indexer.shape)
+    value_array = np.asanyarray(values)
+    if value_array.size == npoints:
+        flat_values = value_array.reshape(-1)
+    else:
+        try:
+            flat_values = np.broadcast_to(value_array, indexer.sel_shape).reshape(-1)
+        except ValueError as e:
+            raise ValueError(
+                f"could not broadcast value of shape {value_array.shape} to the "
+                f"coordinate selection shape {indexer.sel_shape}"
+            ) from e
+
+    # Reject values that cannot be combined with the array dtype before
+    # touching the store, so a failed call leaves every chunk untouched. The
+    # check mirrors in-place ufunc semantics (e.g. 'a[i] += x'): the promoted
+    # dtype of array and values must cast back to the array dtype under
+    # "same_kind" rules.
+    values_dtype = flat_values.dtype
+    try:
+        result_dtype = np.promote_types(dtype, values_dtype)
+    except TypeError as e:
+        raise TypeError(
+            f"cannot apply scatter operation {op!r} to array of dtype {dtype} "
+            f"with values of dtype {values_dtype}"
+        ) from e
+    if not np.can_cast(result_dtype, dtype, casting="same_kind"):
+        raise TypeError(
+            f"cannot apply scatter operation {op!r} to array of dtype {dtype} "
+            f"with values of dtype {values_dtype}: the resulting dtype "
+            f"{result_dtype} cannot be cast back to the array dtype"
+        )
+
+    # Determine memory order
+    if metadata.zarr_format == 2:
+        order = metadata.order
+    else:
+        order = config.order
+
+    # need to use the order from the metadata for v2
+    _config = config
+    if metadata.zarr_format == 2:
+        _config = replace(_config, order=order)
+
+    indexed_chunks = list(indexer)
+    if not indexed_chunks:
+        return
+
+    # For regular grids, all chunks share the same ArraySpec, so build it once
+    # and reuse it to avoid per-chunk ChunkGrid lookups and ArraySpec construction.
+    regular_grid = chunk_grid.is_regular
+    if regular_grid:
+        regular_chunk_spec = ArraySpec(
+            shape=chunk_grid.chunk_shape,
+            dtype=metadata.dtype,
+            fill_value=metadata.fill_value,
+            config=_config,
+            prototype=prototype,
+        )
+    chunk_specs = [
+        regular_chunk_spec
+        if regular_grid
+        else _get_chunk_spec(metadata, chunk_grid, chunk_coords, _config, prototype)
+        for chunk_coords, _, _, _ in indexed_chunks
+    ]
+
+    async def _read_chunk(chunk_coords: tuple[int, ...], chunk_spec: ArraySpec) -> NDBuffer:
+        chunk_buffer = prototype.nd_buffer.empty(shape=chunk_spec.shape, dtype=dtype, order=order)
+        await codec_pipeline.read(
+            [
+                (
+                    store_path / metadata.encode_chunk_key(chunk_coords),
+                    chunk_spec,
+                    tuple(slice(None) for _ in chunk_spec.shape),
+                    (),
+                    True,
+                )
+            ],
+            chunk_buffer,
+            drop_axes=(),
+        )
+        return chunk_buffer
+
+    # Phase 1: read every touched chunk in full. Missing chunks read back as
+    # the fill value, which is the identity the updates are combined with.
+    chunk_buffers = await concurrent_map(
+        [
+            (chunk_coords, chunk_spec)
+            for (chunk_coords, *_), chunk_spec in zip(indexed_chunks, chunk_specs, strict=True)
+        ],
+        _read_chunk,
+        zarr_config.get("async.concurrency"),
+    )
+
+    # Phase 2: merge the updates into the decoded chunks. Duplicated
+    # coordinates within the batch are combined by the ufunc itself
+    # (np.add.at and friends are unbuffered), so the result does not depend on
+    # the order or grouping of the coordinates. All merges happen before any
+    # chunk is written, so a ufunc error (e.g. an unsupported dtype) cannot
+    # leave partial writes behind.
+    for (_, chunk_selection, out_selection, _), chunk_buffer in zip(
+        indexed_chunks, chunk_buffers, strict=True
+    ):
+        ufunc.at(
+            cast("npt.NDArray[Any]", chunk_buffer.as_ndarray_like()),
+            cast("Any", chunk_selection),
+            flat_values[out_selection],
+        )
+
+    async def _write_chunk(
+        chunk_coords: tuple[int, ...], chunk_spec: ArraySpec, chunk_buffer: NDBuffer
+    ) -> None:
+        await codec_pipeline.write(
+            [
+                (
+                    store_path / metadata.encode_chunk_key(chunk_coords),
+                    chunk_spec,
+                    tuple(slice(None) for _ in chunk_spec.shape),
+                    (),
+                    True,
+                )
+            ],
+            chunk_buffer,
+            drop_axes=(),
+        )
+
+    # Phase 3: write each merged chunk back as a complete chunk, so no chunk
+    # is read or written more than once per call.
+    await concurrent_map(
+        [
+            (chunk_coords, chunk_spec, chunk_buffer)
+            for (chunk_coords, *_), chunk_spec, chunk_buffer in zip(
+                indexed_chunks, chunk_specs, chunk_buffers, strict=True
+            )
+        ],
+        _write_chunk,
+        zarr_config.get("async.concurrency"),
     )

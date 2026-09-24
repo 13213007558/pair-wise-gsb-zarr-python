@@ -54,6 +54,7 @@ SelectionNormalized = tuple[Selector, ...] | ArrayOfIntOrBool
 SelectionWithFields = Selection | str | Sequence[str]
 SelectorTuple = tuple[Selector, ...] | npt.NDArray[np.intp] | slice
 Fields = str | list[str] | tuple[str, ...]
+ScatterOp = Literal["add", "min", "max"]
 
 
 def err_too_many_indices(selection: Any, shape: tuple[int, ...]) -> None:
@@ -1417,6 +1418,29 @@ class VIndex:
                 f"(single Boolean array) are supported; got {new_selection!r}"
             )
             raise VindexInvalidSelectionError(msg)
+
+    def add(self, selection: CoordinateSelection, values: npt.ArrayLike) -> None:
+        """Add values into the array at the given coordinates, in a single call.
+
+        Coordinates may repeat, be unordered, or contain negative indices;
+        repeated coordinates are summed. See [scatter][zarr.Array.scatter] for
+        details.
+        """
+        self.array.scatter(selection, values, op="add")
+
+    def min(self, selection: CoordinateSelection, values: npt.ArrayLike) -> None:
+        """Keep the elementwise minimum of the array and values at the given
+        coordinates, in a single call. See [scatter][zarr.Array.scatter] for
+        details.
+        """
+        self.array.scatter(selection, values, op="min")
+
+    def max(self, selection: CoordinateSelection, values: npt.ArrayLike) -> None:
+        """Keep the elementwise maximum of the array and values at the given
+        coordinates, in a single call. See [scatter][zarr.Array.scatter] for
+        details.
+        """
+        self.array.scatter(selection, values, op="max")
 
     def __setitem__(
         self, selection: CoordinateSelection | MaskSelection, value: npt.ArrayLike
