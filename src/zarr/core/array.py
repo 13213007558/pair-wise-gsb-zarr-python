@@ -133,6 +133,7 @@ from zarr.core.metadata.v3 import (
     parse_node_type_array,
 )
 from zarr.core.sync import sync
+from zarr.core.window import Window, WindowExtensionMode, plan_window
 from zarr.errors import (
     ArrayNotFoundError,
     ChunkNotFoundError,
@@ -1535,6 +1536,107 @@ class AsyncArray[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
             selection,
             prototype=prototype,
         )
+
+    async def get_window(
+        self,
+        window: Window,
+        *,
+        mode: WindowExtensionMode
+        | tuple[WindowExtensionMode, ...]
+        | list[WindowExtensionMode] = "constant",
+        fill_value: Any | None = None,
+        prototype: BufferPrototype | None = None,
+    ) -> NDArrayLikeOrScalar:
+        """Asynchronously read a window of data that may extend beyond the array bounds.
+
+        Window coordinates are absolute: coordinate 0 is the first element of the
+        array along each axis, negative coordinates lie before the start of the
+        array, and coordinates greater than or equal to the axis length lie past
+        the end of the array. The shape of the result always matches the requested
+        window exactly; out-of-bounds positions are resolved according to ``mode``.
+        The array itself is never modified by this operation.
+
+        Parameters
+        ----------
+        window : slice or tuple of slice
+            The window to read, given as one unit-stride slice per axis. Slices
+            may extend beyond the array bounds on either side. Unlike regular
+            indexing, negative bounds are *not* interpreted relative to the end
+            of the array. Missing axes read the whole axis.
+        mode : {"constant", "reflect", "wrap"} or sequence thereof, optional
+            How out-of-bounds coordinates are resolved, either a single mode
+            applied to every axis or one mode per axis. "constant" fills with
+            ``fill_value``, "reflect" mirrors the data at the edges without
+            repeating the edge element, and "wrap" tiles the data periodically.
+        fill_value : Any, optional
+            The value used for out-of-bounds positions when ``mode`` is
+            "constant". Defaults to the array's fill value. The value is cast
+            to the array's dtype.
+        prototype : BufferPrototype, optional
+            A buffer prototype to use for reading the chunk data (default is None).
+
+        Returns
+        -------
+        NDArrayLikeOrScalar
+            An array whose shape equals the requested window shape.
+
+        Notes
+        -----
+        Only the chunks overlapping the source data actually required by the
+        window are read, and source regions are read at most once even when
+        "reflect" or "wrap" reuse them multiple times.
+
+        Examples
+        --------
+        >>> import zarr
+        >>> import numpy as np
+        >>> z = zarr.create_array({}, shape=(4,), chunks=(2,), dtype="i4", fill_value=-1)
+        >>> z[:] = np.arange(4)
+        >>> z.get_window(slice(-2, 6), mode="constant")
+        array([-1, -1,  0,  1,  2,  3, -1, -1], dtype=int32)
+        >>> z.get_window(slice(-2, 6), mode="reflect")
+        array([2, 1, 0, 1, 2, 3, 2, 1], dtype=int32)
+        >>> z.get_window(slice(-2, 6), mode="wrap")
+        array([2, 3, 0, 1, 2, 3, 0, 1], dtype=int32)
+        """
+        if prototype is None:
+            prototype = default_buffer_prototype()
+        plans = plan_window(window, self.shape, mode)
+        out_shape = tuple(plan.nitems for plan in plans)
+        dtype = self.dtype
+        if fill_value is None:
+            fill_value = self.metadata.fill_value
+
+        # empty window: nothing to read
+        if 0 in out_shape:
+            return np.empty(out_shape, dtype=dtype)
+
+        read_selection = tuple(slice(plan.read_start, plan.read_stop) for plan in plans)
+
+        # fast path: the window lies entirely inside the array
+        if all(plan.covers_window for plan in plans):
+            return await self.getitem(read_selection, prototype=prototype)
+
+        # a constant-mode axis may not intersect the array at all
+        if any(plan.read_len == 0 for plan in plans):
+            return np.full(out_shape, fill_value, dtype=dtype)
+
+        source = np.asarray(await self.getitem(read_selection, prototype=prototype))
+        result: npt.NDArray[Any] = source
+        for axis, plan in enumerate(plans):
+            if plan.take_indices is not None:
+                result = np.take(result, plan.take_indices, axis=axis)
+        if all(plan.take_indices is not None or plan.covers_window for plan in plans):
+            return result
+        out = np.full(out_shape, fill_value, dtype=dtype)
+        dest = tuple(
+            slice(None)
+            if plan.take_indices is not None
+            else slice(plan.out_start, plan.out_start + plan.read_len)
+            for plan in plans
+        )
+        out[dest] = result
+        return out
 
     async def get_orthogonal_selection(
         self,
@@ -2944,6 +3046,78 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
                 prototype=prototype,
             )
         )
+
+    def get_window(
+        self,
+        window: Window,
+        *,
+        mode: WindowExtensionMode
+        | tuple[WindowExtensionMode, ...]
+        | list[WindowExtensionMode] = "constant",
+        fill_value: Any | None = None,
+    ) -> NDArrayLikeOrScalar:
+        """Read a window of data that may extend beyond the array bounds.
+
+        Window coordinates are absolute: coordinate 0 is the first element of the
+        array along each axis, negative coordinates lie before the start of the
+        array, and coordinates greater than or equal to the axis length lie past
+        the end of the array. The shape of the result always matches the requested
+        window exactly; out-of-bounds positions are resolved according to ``mode``.
+        The array itself is never modified by this operation.
+
+        Parameters
+        ----------
+        window : slice or tuple of slice
+            The window to read, given as one unit-stride slice per axis. Slices
+            may extend beyond the array bounds on either side. Unlike regular
+            indexing, negative bounds are *not* interpreted relative to the end
+            of the array. Missing axes read the whole axis.
+        mode : {"constant", "reflect", "wrap"} or sequence thereof, optional
+            How out-of-bounds coordinates are resolved, either a single mode
+            applied to every axis or one mode per axis. "constant" fills with
+            ``fill_value``, "reflect" mirrors the data at the edges without
+            repeating the edge element, and "wrap" tiles the data periodically.
+        fill_value : Any, optional
+            The value used for out-of-bounds positions when ``mode`` is
+            "constant". Defaults to the array's fill value. The value is cast
+            to the array's dtype.
+
+        Returns
+        -------
+        NDArrayLikeOrScalar
+            An array whose shape equals the requested window shape.
+
+        Notes
+        -----
+        Only the chunks overlapping the source data actually required by the
+        window are read, and source regions are read at most once even when
+        "reflect" or "wrap" reuse them multiple times.
+
+        Examples
+        --------
+        Setup a 1-dimensional array:
+
+            >>> import zarr
+            >>> import numpy as np
+            >>> z = zarr.create_array(
+            ...     {},
+            ...     shape=(4,),
+            ...     chunks=(2,),
+            ...     dtype="i4",
+            ...     fill_value=-1,
+            ... )
+            >>> z[:] = np.arange(4)
+
+        Read a window that extends past both ends of the array:
+
+            >>> z.get_window(slice(-2, 6), mode="constant")
+            array([-1, -1,  0,  1,  2,  3, -1, -1], dtype=int32)
+            >>> z.get_window(slice(-2, 6), mode="reflect")
+            array([2, 1, 0, 1, 2, 3, 2, 1], dtype=int32)
+            >>> z.get_window(slice(-2, 6), mode="wrap")
+            array([2, 3, 0, 1, 2, 3, 0, 1], dtype=int32)
+        """
+        return sync(self.async_array.get_window(window, mode=mode, fill_value=fill_value))
 
     def set_basic_selection(
         self,
