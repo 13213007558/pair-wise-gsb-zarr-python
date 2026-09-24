@@ -105,6 +105,7 @@ from zarr.core.indexing import (
     _iter_grid,
     check_fields,
     check_no_multi_fields,
+    is_integer,
     is_pure_fancy_indexing,
     is_pure_orthogonal_indexing,
     is_scalar,
@@ -133,6 +134,12 @@ from zarr.core.metadata.v3 import (
     parse_node_type_array,
 )
 from zarr.core.sync import sync
+from zarr.core.window import (
+    WindowMode,
+    axis_runs,
+    iter_axis_run_products,
+    parse_window_modes,
+)
 from zarr.errors import (
     ArrayNotFoundError,
     ChunkNotFoundError,
@@ -1535,6 +1542,167 @@ class AsyncArray[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
             selection,
             prototype=prototype,
         )
+
+    async def get_window(
+        self,
+        origin: Sequence[int],
+        shape: Sequence[int],
+        *,
+        mode: WindowMode | Sequence[WindowMode] = "constant",
+        constant_value: Any | None = None,
+        prototype: BufferPrototype | None = None,
+    ) -> NDArrayLikeOrScalar:
+        """Read a rectangular window that may extend beyond the array bounds.
+
+        The window is defined by `origin` (its first coordinate, in array
+        coordinates, which may be negative or past the end of the array) and
+        `shape` (its extent along each axis). The result always has exactly
+        the requested `shape`; coordinates are never clipped to the array
+        bounds. Positions outside the array are resolved per axis with one of
+        three extension modes:
+
+        - "constant": filled with `constant_value` (default: the array's
+          fill value).
+        - "reflect": mirrored about the array edges without repeating the
+          edge element, like numpy.pad with mode="reflect".
+        - "wrap": repeated periodically with the axis length, like numpy.pad
+          with mode="wrap".
+
+        Only unit-stride windows are supported, and the read is read-only: the
+        array's shape and stored data are never modified. Only chunks that
+        intersect source data actually required by the window are read, and
+        source regions that occur more than once (e.g. with "wrap" windows
+        spanning multiple periods) are read only once and reused.
+
+        Parameters
+        ----------
+        origin : sequence of int
+            The first coordinate of the window, in array coordinates. One
+            entry per array dimension; entries may be negative or beyond the
+            end of the array.
+        shape : sequence of int
+            The shape of the window. One non-negative entry per array
+            dimension. The returned array has exactly this shape.
+        mode : {"constant", "reflect", "wrap"} or sequence thereof, optional
+            The extension mode, either a single value applied to every axis or
+            one value per axis. Default is "constant".
+        constant_value : scalar, optional
+            The value used for out-of-bounds positions on axes using
+            mode="constant". It is cast to the array's dtype. If not given,
+            the array's fill value is used.
+        prototype : BufferPrototype, optional
+            A buffer prototype to use for the retrieved data (default is None).
+
+        Returns
+        -------
+        NDArrayLikeOrScalar
+            An array with the requested window `shape`.
+
+        Notes
+        -----
+        Axes of length 0 cannot be extended with "reflect" or "wrap" (there
+        are no elements to sample) and raise a ValueError unless the window
+        has length 0 along that axis. On axes of length 1, "reflect" and
+        "wrap" both map every position to the single element. Out-of-bounds
+        offsets larger than the axis length (including multiples of it) are
+        reduced modulo the reflection period or the axis length, respectively.
+
+        Examples
+        --------
+        >>> import zarr
+        >>> import numpy as np
+        >>> z = zarr.create_array(
+        ...     {},
+        ...     shape=(4,),
+        ...     chunks=(2,),
+        ...     dtype="i4",
+        ...     fill_value=0,
+        ... )
+        >>> z[:] = np.arange(4)
+        >>> import asyncio
+        >>> asyncio.run(z.async_array.get_window((-2,), (6,), mode="reflect"))
+        array([2, 1, 0, 1, 2, 3], dtype=int32)
+        >>> asyncio.run(z.async_array.get_window((2,), (5,), mode="wrap"))
+        array([2, 3, 0, 1, 2], dtype=int32)
+        """
+        if prototype is None:
+            prototype = default_buffer_prototype()
+        array_shape = self.metadata.shape
+        ndim = len(array_shape)
+        origin_parsed = tuple(origin)
+        shape_parsed = tuple(shape)
+        if len(origin_parsed) != ndim:
+            raise ValueError(
+                f"Window origin must have one entry per array dimension; "
+                f"expected {ndim}, got {len(origin_parsed)}."
+            )
+        if len(shape_parsed) != ndim:
+            raise ValueError(
+                f"Window shape must have one entry per array dimension; "
+                f"expected {ndim}, got {len(shape_parsed)}."
+            )
+        if not all(is_integer(o) for o in origin_parsed):
+            raise TypeError(f"Window origin entries must be integers, got {origin_parsed!r}.")
+        if not all(is_integer(s) for s in shape_parsed):
+            raise TypeError(f"Window shape entries must be integers, got {shape_parsed!r}.")
+        origin_ints = tuple(int(o) for o in origin_parsed)
+        shape_ints = tuple(int(s) for s in shape_parsed)
+        modes = parse_window_modes(mode, ndim)
+        runs_per_axis = [
+            axis_runs(o, s, n, m, axis)
+            for axis, (o, s, n, m) in enumerate(
+                zip(origin_ints, shape_ints, array_shape, modes, strict=True)
+            )
+        ]
+
+        zdtype = self.metadata.dtype
+        dtype = zdtype.to_native_dtype()
+        fill_value: Any
+        if constant_value is None:
+            fill_value = self.metadata.fill_value
+        else:
+            fill_value = zdtype.cast_scalar(constant_value)
+
+        if self.metadata.zarr_format == 2:
+            order = self.metadata.order
+        else:
+            order = self.config.order
+        out_buffer = prototype.nd_buffer.empty(shape=shape_ints, dtype=dtype, order=order)
+
+        if product(shape_ints) > 0:
+            # cache source regions so repeated fragments (e.g. wrap periods)
+            # are only read from the store once
+            region_cache: dict[tuple[tuple[int, int], ...], NDArrayLikeOrScalar] = {}
+            for block in iter_axis_run_products(runs_per_axis):
+                out_selection = tuple(
+                    slice(run.out_start, run.out_start + run.length) for run in block
+                )
+                region: list[slice] = []
+                is_fill_block = False
+                for run in block:
+                    if run.src_start is None:
+                        is_fill_block = True
+                        break
+                    if run.src_step > 0:
+                        region.append(slice(run.src_start, run.src_start + run.length))
+                    else:
+                        region.append(slice(run.src_start - run.length + 1, run.src_start + 1))
+                if is_fill_block:
+                    out_buffer[out_selection] = fill_value
+                    continue
+                region_tuple = tuple(region)
+                cache_key = tuple((s.start, s.stop) for s in region_tuple)
+                data = region_cache.get(cache_key)
+                if data is None:
+                    data = await self.getitem(region_tuple, prototype=prototype)
+                    region_cache[cache_key] = data
+                if any(run.src_step < 0 for run in block):
+                    flip_selection = tuple(
+                        slice(None, None, -1) if run.src_step < 0 else slice(None) for run in block
+                    )
+                    data = cast("Any", data)[flip_selection]
+                out_buffer[out_selection] = data
+        return out_buffer.as_ndarray_like()
 
     async def get_orthogonal_selection(
         self,
@@ -2941,6 +3109,90 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
                 BasicIndexer(selection, self.shape, self._chunk_grid),
                 out=out,
                 fields=fields,
+                prototype=prototype,
+            )
+        )
+
+    def get_window(
+        self,
+        origin: Sequence[int],
+        shape: Sequence[int],
+        *,
+        mode: WindowMode | Sequence[WindowMode] = "constant",
+        constant_value: Any | None = None,
+        prototype: BufferPrototype | None = None,
+    ) -> NDArrayLikeOrScalar:
+        """Read a rectangular window that may extend beyond the array bounds.
+
+        The window is defined by `origin` (its first coordinate, in array
+        coordinates, which may be negative or past the end of the array) and
+        `shape` (its extent along each axis). The result always has exactly
+        the requested `shape`; coordinates are never clipped to the array
+        bounds. Positions outside the array are resolved per axis with one of
+        three extension modes:
+
+        - "constant": filled with `constant_value` (default: the array's
+          fill value).
+        - "reflect": mirrored about the array edges without repeating the
+          edge element, like numpy.pad with mode="reflect".
+        - "wrap": repeated periodically with the axis length, like numpy.pad
+          with mode="wrap".
+
+        Only unit-stride windows are supported, and the read is read-only: the
+        array's shape and stored data are never modified. Only chunks that
+        intersect source data actually required by the window are read, and
+        source regions that occur more than once (e.g. with "wrap" windows
+        spanning multiple periods) are read only once and reused.
+
+        Parameters
+        ----------
+        origin : sequence of int
+            The first coordinate of the window, in array coordinates. One
+            entry per array dimension; entries may be negative or beyond the
+            end of the array.
+        shape : sequence of int
+            The shape of the window. One non-negative entry per array
+            dimension. The returned array has exactly this shape.
+        mode : {"constant", "reflect", "wrap"} or sequence thereof, optional
+            The extension mode, either a single value applied to every axis or
+            one value per axis. Default is "constant".
+        constant_value : scalar, optional
+            The value used for out-of-bounds positions on axes using
+            mode="constant". It is cast to the array's dtype. If not given,
+            the array's fill value is used.
+        prototype : BufferPrototype, optional
+            A buffer prototype to use for the retrieved data (default is None).
+
+        Returns
+        -------
+        NDArrayLikeOrScalar
+            An array with the requested window `shape`.
+
+        Examples
+        --------
+        >>> import zarr
+        >>> import numpy as np
+        >>> z = zarr.create_array(
+        ...     {},
+        ...     shape=(4,),
+        ...     chunks=(2,),
+        ...     dtype="i4",
+        ...     fill_value=-1,
+        ... )
+        >>> z[:] = np.arange(4)
+        >>> z.get_window((-2,), (7,))
+        array([-1, -1,  0,  1,  2,  3, -1], dtype=int32)
+        >>> z.get_window((-2,), (7,), mode="reflect")
+        array([2, 1, 0, 1, 2, 3, 2], dtype=int32)
+        >>> z.get_window((-2,), (7,), mode="wrap")
+        array([2, 3, 0, 1, 2, 3, 0], dtype=int32)
+        """
+        return sync(
+            self.async_array.get_window(
+                origin,
+                shape,
+                mode=mode,
+                constant_value=constant_value,
                 prototype=prototype,
             )
         )
