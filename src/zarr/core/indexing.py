@@ -29,7 +29,6 @@ from zarr.core.metadata.v3 import ArrayV3Metadata
 from zarr.errors import (
     ArrayIndexError,
     BoundsCheckError,
-    NegativeStepError,
     VindexInvalidSelectionError,
 )
 
@@ -406,8 +405,6 @@ class SliceDimIndexer:
     ) -> None:
         # normalize
         start, stop, step = dim_sel.indices(dim_len)
-        if step < 1:
-            raise NegativeStepError("only slices with step >= 1 are supported.")
 
         object.__setattr__(self, "start", start)
         object.__setattr__(self, "stop", stop)
@@ -419,6 +416,10 @@ class SliceDimIndexer:
         object.__setattr__(self, "nchunks", dim_grid.nchunks)
 
     def __iter__(self) -> Iterator[ChunkDimProjection]:
+        if self.step < 0:
+            yield from self._iter_negative_step()
+            return
+
         # figure out the range of chunks we need to visit
         if self.start >= self.stop:
             return  # empty slice
@@ -465,6 +466,63 @@ class SliceDimIndexer:
             is_complete_chunk = (
                 dim_chunk_sel_start == 0 and (self.stop >= dim_limit) and self.step in [1, None]
             )
+            yield ChunkDimProjection(dim_chunk_ix, dim_chunk_sel, dim_out_sel, is_complete_chunk)
+
+    def _iter_negative_step(self) -> Iterator[ChunkDimProjection]:
+        # figure out the range of chunks we need to visit
+        if self.nitems == 0:
+            return  # empty slice
+        g = self.dim_grid
+        m = -self.step  # stride magnitude (> 0)
+        # first and last selected indices, in array coordinates
+        first = self.start
+        last = self.start + (self.nitems - 1) * self.step
+        dim_chunk_ix_from = g.index_to_chunk(last)
+        dim_chunk_ix_to = g.index_to_chunk(first) + 1
+
+        # iterate over chunks in range, in storage order; the output offsets
+        # (dim_out_sel) place each chunk's items at their position in the
+        # user-facing (reversed) selection order
+        for dim_chunk_ix in range(dim_chunk_ix_from, dim_chunk_ix_to):
+            # compute offsets for chunk within overall array
+            dim_offset = g.chunk_offset(dim_chunk_ix)
+            # determine chunk length, accounting for trailing chunk
+            dim_chunk_len = g.data_size(dim_chunk_ix)
+            dim_limit = dim_offset + dim_chunk_len
+
+            if first < dim_limit:
+                # selection starts within current chunk
+                first_idx = first
+                k_first = 0
+            else:
+                # selection starts in a later chunk; find the first selected
+                # index falling inside the current chunk
+                k_first = ceildiv(first - dim_limit + 1, m)
+                first_idx = first - k_first * m
+
+            if first_idx < dim_offset:
+                # the stride skips over this chunk entirely
+                continue
+
+            # last selected index within this chunk: the global stop may cut
+            # the selection off before the chunk boundary is reached
+            floor = max(dim_offset, last)
+            last_idx = first_idx - ((first_idx - floor) // m) * m
+            dim_chunk_nitems = (first_idx - last_idx) // m + 1
+
+            dim_chunk_sel_start = first_idx - dim_offset
+            dim_chunk_sel_stop = last_idx - dim_offset - 1
+            dim_chunk_sel = slice(
+                dim_chunk_sel_start,
+                # a stop of -1 would be re-normalized to the end of the chunk,
+                # so use None to include index 0
+                None if dim_chunk_sel_stop < 0 else dim_chunk_sel_stop,
+                self.step,
+            )
+
+            dim_out_sel = slice(k_first, k_first + dim_chunk_nitems)
+            # a negative-step selection never covers a complete chunk
+            is_complete_chunk = False
             yield ChunkDimProjection(dim_chunk_ix, dim_chunk_sel, dim_out_sel, is_complete_chunk)
 
 
@@ -554,10 +612,6 @@ def is_contiguous_slice(s: Any) -> TypeGuard[slice]:
     return is_slice(s) and (s.step is None or s.step == 1)
 
 
-def is_positive_slice(s: Any) -> TypeGuard[slice]:
-    return is_slice(s) and (s.step is None or s.step >= 1)
-
-
 def is_contiguous_selection(selection: Any) -> TypeGuard[slice]:
     selection = ensure_tuple(selection)
     return all((is_integer_array(s) or is_contiguous_slice(s) or s == Ellipsis) for s in selection)
@@ -565,7 +619,7 @@ def is_contiguous_selection(selection: Any) -> TypeGuard[slice]:
 
 def is_basic_selection(selection: Any) -> TypeGuard[BasicSelection]:
     selection = ensure_tuple(selection)
-    return all(is_integer(s) or is_positive_slice(s) for s in selection)
+    return all(is_integer(s) or is_slice(s) for s in selection)
 
 
 @dataclass(frozen=True)

@@ -226,15 +226,17 @@ _BASIC_1D_CASES: list[Expect[BasicSelection, None]] = [
     Expect(input=(Ellipsis, slice(None)), output=None, id="ellipsis-slice"),
     Expect(input=slice(None, None, 3), output=None, id="stride-3"),
     Expect(input=slice(3, 27, 5), output=None, id="bounded-stride"),
+    Expect(input=slice(None, None, -1), output=None, id="reverse"),
+    Expect(input=slice(None, None, -2), output=None, id="reverse-stride-2"),
+    Expect(input=slice(28, 2, -3), output=None, id="bounded-reverse-stride"),
+    Expect(input=slice(-1, -31, -1), output=None, id="reverse-negative-bounds"),
+    Expect(input=slice(-20, -3, -2), output=None, id="empty-reverse-negative-bounds"),
+    Expect(input=slice(0, 0, -1), output=None, id="empty-reverse"),
+    Expect(input=slice(None, 2, -1), output=None, id="reverse-open-start"),
+    Expect(input=slice(29, None, -4), output=None, id="reverse-open-stop"),
 ]
 
 _BASIC_1D_BAD_CASES: list[ExpectFail[Any]] = [
-    ExpectFail(
-        input=slice(None, None, -1),
-        exception=IndexError,
-        id="negative-step",
-        msg="only slices with step >= 1 are supported",
-    ),
     ExpectFail(
         input=2.3,
         exception=IndexError,
@@ -306,7 +308,7 @@ def test_get_basic_selection_1d(store: StorePath, case: Expect[BasicSelection, N
 
 @pytest.mark.parametrize("case", _BASIC_1D_BAD_CASES, ids=lambda c: c.id)
 def test_get_basic_selection_1d_raises(store: StorePath, case: ExpectFail[Any]) -> None:
-    """Basic getitem on a 1D array rejects negative steps and invalid index types with IndexError."""
+    """Basic getitem on a 1D array rejects invalid index types with IndexError."""
     a = np.arange(30, dtype=int)
     z = zarr_array_from_numpy_array(store, a, chunk_shape=(7,))
     with case.raises():
@@ -328,6 +330,15 @@ _BASIC_2D_CASES: list[Expect[BasicSelection, None]] = [
     Expect(input=(slice(0, 12, 3), slice(0, 5, 2)), output=None, id="strided-2d-slice"),
     Expect(input=Ellipsis, output=None, id="ellipsis"),
     Expect(input=(), output=None, id="empty-tuple"),
+    Expect(
+        input=(slice(None, None, -1), slice(None, None, -1)), output=None, id="reverse-both-axes"
+    ),
+    Expect(input=(slice(None, None, -2), slice(4, 1, -3)), output=None, id="reverse-strided-2d"),
+    Expect(input=(slice(11, 2, -3), slice(None)), output=None, id="reverse-rows"),
+    Expect(input=(slice(None), slice(None, None, -2)), output=None, id="reverse-cols"),
+    Expect(input=(3, slice(None, None, -2)), output=None, id="int-row-reverse-cols"),
+    Expect(input=(slice(None, None, -3), -1), output=None, id="reverse-rows-int-col"),
+    Expect(input=(slice(0, 0, -1), slice(None, None, -1)), output=None, id="empty-reverse-rows"),
 ]
 
 _BASIC_2D_BAD_CASES: list[ExpectFail[Any]] = [
@@ -358,12 +369,6 @@ _BASIC_2D_BAD_CASES: list[ExpectFail[Any]] = [
         id="float-in-tuple",
         msg="unsupported selection item for basic indexing; expected integer or slice, got <class 'float'>",
         escape=True,
-    ),
-    ExpectFail(
-        input=slice(None, None, -1),
-        exception=IndexError,
-        id="negative-step",
-        msg="only slices with step >= 1 are supported",
     ),
     ExpectFail(
         input=(slice(None), slice(None), slice(None)),
@@ -403,6 +408,39 @@ def test_basic_2d_fancy_fallback(store: StorePath) -> None:
     a = np.arange(60, dtype=int).reshape(12, 5)
     z = zarr_array_from_numpy_array(store, a, chunk_shape=(5, 2))
     np.testing.assert_array_equal(z[([0, 1], [0, 1])], a[([0, 1], [0, 1])])
+
+
+_NEGATIVE_STEP_2D_CASES: list[Expect[BasicSelection, None]] = [
+    Expect(
+        input=(slice(None, None, -1), slice(None, None, -1)), output=None, id="reverse-both-axes"
+    ),
+    Expect(input=(slice(None, None, -2), slice(4, 1, -3)), output=None, id="reverse-strided"),
+    Expect(input=(slice(11, 2, -3), slice(None)), output=None, id="reverse-rows"),
+    Expect(input=(slice(None), slice(None, None, -2)), output=None, id="reverse-cols"),
+    Expect(input=(3, slice(None, None, -2)), output=None, id="int-row-reverse-cols"),
+    Expect(input=(slice(None, None, -3), -1), output=None, id="reverse-rows-int-col"),
+    Expect(input=(slice(0, 0, -1), slice(None, None, -1)), output=None, id="empty-reverse-rows"),
+]
+
+
+@pytest.mark.parametrize("case", _NEGATIVE_STEP_2D_CASES, ids=lambda c: c.id)
+def test_set_negative_step_2d(store: StorePath, case: Expect[BasicSelection, None]) -> None:
+    """Setting negative-step slices on a 2D array matches numpy for scalar and array values."""
+    v = np.arange(60, dtype=int).reshape(12, 5)
+    a = np.empty_like(v)
+    z = zarr_array_from_numpy_array(store, a, chunk_shape=(5, 2))
+    for value in (42, v[case.input]):
+        # setup expectation
+        a[:] = 0
+        a[case.input] = value
+        # long-form API
+        z[:] = 0
+        z.set_basic_selection(case.input, value)
+        assert_array_equal(a, z[:])
+        # short-form API
+        z[:] = 0
+        z[case.input] = value
+        assert_array_equal(a, z[:])
 
 
 def test_get_basic_selection_1d_rejects_integer_list(store: StorePath) -> None:
@@ -779,6 +817,11 @@ _ORTHO_2D_CASES: list[Expect[OrthogonalSelection, None]] = [
     Expect(input=(slice(None), 3), output=None, id="single-col"),
     Expect(input=(slice(None), slice(None)), output=None, id="full"),
     Expect(input=slice(2, 9), output=None, id="row-slice"),
+    Expect(
+        input=(slice(None, None, -1), slice(None, None, -1)), output=None, id="reverse-both-axes"
+    ),
+    Expect(input=(slice(None, None, -2), slice(4, 1, -3)), output=None, id="reverse-strided"),
+    Expect(input=(slice(None, None, -1), 3), output=None, id="reverse-rows-int-col"),
 ]
 
 _ORTHO_2D_BAD_CASES: list[ExpectFail[Any]] = [
@@ -801,12 +844,6 @@ _ORTHO_2D_BAD_CASES: list[ExpectFail[Any]] = [
         exception=IndexError,
         id="none-index",
         msg="unsupported selection item for orthogonal indexing",
-    ),
-    ExpectFail(
-        input=slice(None, None, -1),
-        exception=IndexError,
-        id="negative-step",
-        msg="only slices with step >= 1 are supported",
     ),
     ExpectFail(
         input=(0, 0, 0),
@@ -2019,6 +2056,29 @@ def test_numpy_int_indexing(store: StorePath) -> None:
                 ("__setitem__", (slice(None), (slice(None)))),
             ],
         ),
+        # negative-step selections
+        ((1070,), (50,), [("__getitem__", (slice(None, None, -3),))]),
+        (
+            (1070,),
+            (50,),
+            [
+                ("__getitem__", (slice(None, None, -3),)),
+                ("__setitem__", (slice(1000, 100, -7),)),
+            ],
+        ),
+        (
+            (40, 50),
+            (5, 8),
+            [("__getitem__", (slice(None, None, -1), slice(49, 10, -3)))],
+        ),
+        (
+            (40, 50),
+            (5, 8),
+            [
+                ("__getitem__", (slice(None, None, -1), slice(49, 10, -3))),
+                ("__setitem__", (slice(37, 2, -5), slice(None, None, -2))),
+            ],
+        ),
     ],
 )
 async def test_accessed_chunks(
@@ -2071,6 +2131,45 @@ async def test_accessed_chunks(
                 ) == 1
         # Check that no other chunks were accessed
         assert len(delta_counts) == 0
+
+
+@pytest.mark.parametrize(
+    ("selection", "expected_keys"),
+    [
+        # rows 11, 9, 7, 5 only touch the first row of shards
+        ((slice(11, 3, -2), slice(None)), {"0.0", "0.1"}),
+        # reversing both axes touches every shard
+        (
+            (slice(None, None, -1), slice(None, None, -1)),
+            {"0.0", "0.1", "1.0", "1.1"},
+        ),
+        # rows 20, 17, 14 and column 5 only touch a single shard
+        ((slice(20, 11, -3), 5), {"1.0"}),
+    ],
+)
+async def test_negative_step_sharding_accessed_chunks(
+    selection: tuple[slice | int, ...], expected_keys: set[str]
+) -> None:
+    """A negative-step selection on a sharded array reads and writes only the shards it intersects."""
+    store = await CountingDict.open()
+    a = np.arange(24 * 24, dtype=int).reshape(24, 24)
+    z = zarr_array_from_numpy_array(
+        StorePath(store), a, chunk_shape=(4, 4), shards=(12, 12)
+    )
+
+    # read: only the intersected shard keys are fetched, and data matches numpy
+    counts_before = store.counter.copy()
+    assert_array_equal(z[selection], a[selection])
+    read_delta = store.counter - counts_before
+    assert {key for op, key in read_delta if op == "__getitem__"} == expected_keys
+
+    # write: only the intersected shard keys are stored, and data matches numpy
+    counts_before = store.counter.copy()
+    z[selection] = 42
+    a[selection] = 42
+    write_delta = store.counter - counts_before
+    assert {key for op, key in write_delta if op == "__setitem__"} == expected_keys
+    assert_array_equal(z[:], a)
 
 
 @pytest.mark.parametrize(
