@@ -140,6 +140,13 @@ Note that when an array is resized, the underlying data are not rearranged in
 any way. If one or more dimensions are shrunk, any chunks falling outside the
 new array shape will be deleted from the underlying store.
 
+By default, chunks that only partially fall outside the new shape (boundary
+chunks) are left intact, so a subsequent resize that grows the array may
+restore the old values they still contain. To prevent this, pass
+``erase=True`` to [`zarr.Array.resize`][]: cells falling outside the new
+shape are then overwritten with the array's fill value before the new shape is
+committed, and only the boundary chunks are read and rewritten.
+
 [`zarr.Array.append`][] is provided as a convenience function, which can be
 used to append data to any axis. E.g.:
 
