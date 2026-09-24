@@ -66,6 +66,7 @@ __all__ = [
     "open_consolidated",
     "open_group",
     "open_like",
+    "rechunk_array",
     "save",
     "save_array",
     "save_group",
@@ -134,6 +135,69 @@ def copy_store(*args: Any, **kwargs: Any) -> tuple[int, int, int]:
     Not implemented.
     """
     return sync(async_api.copy_store(*args, **kwargs))
+
+
+def rechunk_array(
+    source: Array | AsyncArray[Any],
+    dest: StoreLike,
+    *,
+    chunks: tuple[int, ...],
+    compressors: CompressorsLike = "auto",
+    max_mem: int,
+    path: str | None = None,
+    overwrite: bool = False,
+    storage_options: dict[str, Any] | None = None,
+) -> Array:
+    """
+    Copy ``source`` to ``dest`` with a new chunk layout, preserving the shape,
+    dtype, fill value, and values of the array.
+
+    Parameters
+    ----------
+    source : Array | AsyncArray
+        The array to copy.  It may be sharded and may have unwritten
+        (implicit fill-value) regions.
+    dest : StoreLike
+        Where to write the new array.
+    chunks : tuple[int, ...]
+        The chunk shape of the new array.  It does not need to divide the
+        array shape or relate to the source chunking in any way.
+    compressors : CompressorsLike, optional
+        Compressor(s) for the new array.  The default, ``"auto"``, keeps the
+        source array's compressor(s).
+    max_mem : int
+        Decoded working-memory budget in bytes (not a task count).  At most
+        one decoded source chunk plus one decoded target chunk are held in
+        memory at any time; a :class:`ValueError` is raised before anything
+        is written if that minimal unit does not fit.
+    path : str, optional
+        Path of the new array within ``dest``.
+    overwrite : bool, optional
+        If True, delete any pre-existing node at the destination first.
+    storage_options : dict, optional
+        Passed to :func:`zarr.storage.make_store_path` for ``dest``.
+
+    Returns
+    -------
+    Array
+        The completed new array.  If the copy fails partway through, the
+        destination is left without array metadata, which is how an
+        incomplete copy is recognized.
+    """
+    return Array(
+        sync(
+            async_api.rechunk_array(
+                source,
+                dest,
+                chunks=chunks,
+                compressors=compressors,
+                max_mem=max_mem,
+                path=path,
+                overwrite=overwrite,
+                storage_options=storage_options,
+            )
+        )
+    )
 
 
 def load(

@@ -54,6 +54,7 @@ if TYPE_CHECKING:
 
     from zarr.abc.codec import Codec
     from zarr.abc.numcodec import Numcodec
+    from zarr.core.array import CompressorsLike
     from zarr.core.buffer import NDArrayLikeOrScalar
     from zarr.core.chunk_key_encodings import ChunkKeyEncoding
     from zarr.core.metadata.v2 import CompressorLikev2
@@ -87,6 +88,7 @@ __all__ = [
     "open_consolidated",
     "open_group",
     "open_like",
+    "rechunk_array",
     "save",
     "save_array",
     "save_group",
@@ -281,6 +283,41 @@ async def copy_store(*args: Any, **kwargs: Any) -> tuple[int, int, int]:
     Not implemented.
     """
     raise NotImplementedError
+
+
+async def rechunk_array(
+    source: AnyAsyncArray | AnyArray,
+    dest: StoreLike,
+    *,
+    chunks: tuple[int, ...],
+    compressors: CompressorsLike = "auto",
+    max_mem: int,
+    path: str | None = None,
+    overwrite: bool = False,
+    storage_options: dict[str, Any] | None = None,
+) -> AnyAsyncArray:
+    """
+    Copy ``source`` to ``dest`` with a new chunk layout, preserving the shape,
+    dtype, fill value, and values of the array.
+
+    The copy is bounded by a decoded working-memory budget: at most one
+    decoded source chunk and one decoded target chunk are held in memory at
+    any time, and a :class:`ValueError` is raised before anything is written
+    if that minimal unit does not fit in ``max_mem``.  See
+    :func:`zarr.core.rechunk.rechunk_array` for full documentation.
+    """
+    from zarr.core.rechunk import rechunk_array as _rechunk_array
+
+    return await _rechunk_array(
+        source,
+        dest,
+        chunks=chunks,
+        compressors=compressors,
+        max_mem=max_mem,
+        path=path,
+        overwrite=overwrite,
+        storage_options=storage_options,
+    )
 
 
 async def load(
