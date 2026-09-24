@@ -1698,7 +1698,9 @@ class AsyncArray[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         [set_mask_selection][zarr.Array.set_mask_selection] for documentation and examples."""
         return AsyncVIndex(self)
 
-    async def resize(self, new_shape: ShapeLike, delete_outside_chunks: bool = True) -> None:
+    async def resize(
+        self, new_shape: ShapeLike, delete_outside_chunks: bool = True, erase: bool = False
+    ) -> None:
         """
         Asynchronously resize the array to a new shape.
 
@@ -1710,6 +1712,12 @@ class AsyncArray[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         delete_outside_chunks : bool, optional
             If True (default), chunks that fall outside the new shape will be deleted. If False,
             the data in those chunks will be preserved.
+        erase : bool, optional
+            If True, all data falling outside the new shape is erased before the new shape is
+            committed: chunks that fall entirely outside the new shape are deleted, and the
+            out-of-bounds cells of retained boundary chunks are overwritten with the array's
+            fill value. If False (default), boundary chunks are left intact and the data they
+            contain outside the new shape may reappear if the array is subsequently grown again.
 
         Returns
         -------
@@ -1725,7 +1733,7 @@ class AsyncArray[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         -----
         - This method is asynchronous and should be awaited.
         """
-        return await _resize(self, new_shape, delete_outside_chunks)
+        return await _resize(self, new_shape, delete_outside_chunks, erase)
 
     async def append(self, data: npt.ArrayLike, axis: int = 0) -> tuple[int, ...]:
         """Append `data` to `axis`.
@@ -3898,7 +3906,7 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         examples."""
         return BlockIndex(self)
 
-    def resize(self, new_shape: ShapeLike) -> None:
+    def resize(self, new_shape: ShapeLike, erase: bool = False) -> None:
         """
         Change the shape of the array by growing or shrinking one or more
         dimensions. This is an in-place operation that modifies the array.
@@ -3907,6 +3915,14 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         ----------
         new_shape : tuple
             New shape of the array.
+        erase : bool, optional
+            If True, all data falling outside the new shape is erased before the
+            new shape is committed: chunks that fall entirely outside the new
+            shape are deleted, and the out-of-bounds cells of retained boundary
+            chunks are overwritten with the array's fill value. If False
+            (default), boundary chunks are left intact and the data they contain
+            outside the new shape may reappear if the array is subsequently
+            grown again.
 
         Notes
         -----
@@ -3934,7 +3950,7 @@ class Array[T_ArrayMetadata: (ArrayV2Metadata, ArrayV3Metadata)]:
         #>(50, 50)
         ```
         """
-        sync(self.async_array.resize(new_shape))
+        sync(self.async_array.resize(new_shape, erase=erase))
 
     def append(self, data: npt.ArrayLike, axis: int = 0) -> tuple[int, ...]:
         """Append `data` to `axis`.
@@ -5883,6 +5899,7 @@ async def _resize(
     array: AsyncArray[ArrayV2Metadata] | AsyncArray[ArrayV3Metadata],
     new_shape: ShapeLike,
     delete_outside_chunks: bool = True,
+    erase: bool = False,
 ) -> None:
     """
     Resize an array to a new shape.
@@ -5896,6 +5913,14 @@ async def _resize(
     delete_outside_chunks : bool, optional
         If True (default), chunks that fall outside the new shape will be deleted.
         If False, the data in those chunks will be preserved.
+    erase : bool, optional
+        If True, all data falling outside the new shape is erased before the
+        new shape is committed: chunks that fall entirely outside the new shape
+        are deleted (regardless of ``delete_outside_chunks``), and the
+        out-of-bounds cells of retained boundary chunks are overwritten with
+        the array's fill value. If False (default), boundary chunks are left
+        intact and the data they contain outside the new shape may reappear if
+        the array is subsequently grown again.
     """
     new_shape = parse_shapelike(new_shape)
     if len(new_shape) != len(array.metadata.shape):
@@ -5910,7 +5935,13 @@ async def _resize(
     # ensure deletion is only run if array is shrinking as the delete_outside_chunks path is unbounded in memory
     only_growing = all(new >= old for new, old in zip(new_shape, array.metadata.shape, strict=True))
 
-    if delete_outside_chunks and not only_growing:
+    if erase and not only_growing:
+        # Overwrite the out-of-bounds region of retained boundary chunks with
+        # the fill value. This must succeed before the new shape is committed
+        # to the metadata below.
+        await _erase_data_outside_shape(array, new_shape)
+
+    if (delete_outside_chunks or erase) and not only_growing:
         # Remove all chunks outside of the new shape
         old_chunk_coords = set(array._chunk_grid.all_chunk_coords())
         new_chunk_coords = set(new_chunk_grid.all_chunk_coords())
@@ -5933,6 +5964,81 @@ async def _resize(
     # Update metadata and chunk_grid (in place)
     object.__setattr__(array, "metadata", new_metadata)
     object.__setattr__(array, "_chunk_grid", new_chunk_grid)
+
+
+async def _erase_data_outside_shape(
+    array: AsyncArray[ArrayV2Metadata] | AsyncArray[ArrayV3Metadata],
+    new_shape: tuple[int, ...],
+) -> None:
+    """
+    Overwrite with the fill value every cell that falls outside ``new_shape``
+    but inside a chunk that intersects the new shape (a boundary chunk).
+
+    Chunks entirely inside the new shape are neither read nor written, and
+    chunks entirely outside the new shape are left untouched (the caller is
+    responsible for deleting them).
+
+    Parameters
+    ----------
+    array : AsyncArray
+        The array being resized. Its current (pre-resize) metadata is used.
+    new_shape : tuple[int, ...]
+        The shape the array is being resized to.
+
+    Raises
+    ------
+    RuntimeError
+        If the underlying store writes fail, so that the truncation is known
+        to be incomplete. The array's metadata is left unchanged in this case.
+    """
+    old_shape = array.metadata.shape
+    chunk_shape = array._chunk_grid.chunk_shape
+
+    # Per-axis extent covered by chunks that intersect the new shape. Chunks
+    # beyond this extent fall entirely outside the new shape and are deleted
+    # by the caller, so they must not be rewritten here.
+    kept_shape = tuple(
+        min(old, ((new + chunk - 1) // chunk) * chunk)
+        for old, new, chunk in zip(old_shape, new_shape, chunk_shape, strict=True)
+    )
+
+    if any(kept == 0 for kept in kept_shape):
+        # The new shape is empty along at least one axis, so no chunks are
+        # retained and there is nothing to erase.
+        return
+
+    fill_value: Any = array.metadata.fill_value
+    if fill_value is None:
+        # Zarr V2 allows a null fill_value; reads of unwritten regions fall
+        # back to the dtype default, so erasing must write the same value.
+        fill_value = array.metadata.dtype.default_scalar()
+
+    try:
+        for axis in range(len(new_shape)):
+            if new_shape[axis] >= kept_shape[axis]:
+                # This axis was not shrunk into the interior of a chunk.
+                continue
+            # Erase the slab of retained cells beyond the new shape along this
+            # axis. The union of these slabs over all shrunk axes covers every
+            # out-of-bounds cell of every boundary chunk.
+            selection = tuple(
+                slice(new_shape[axis], kept_shape[axis]) if i == axis else slice(0, kept_shape[i])
+                for i in range(len(new_shape))
+            )
+            await _setitem(
+                array.store_path,
+                array.metadata,
+                array.codec_pipeline,
+                array.config,
+                array._chunk_grid,
+                selection,
+                fill_value,
+            )
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to erase data outside the new shape {new_shape}: the "
+            "truncation is incomplete and the array metadata was not updated."
+        ) from e
 
 
 async def _append(

@@ -873,6 +873,229 @@ def test_resize_growing_skips_chunk_enumeration(
 
 
 @pytest.mark.parametrize("store", ["memory"], indirect=True)
+def test_resize_erase_1d(store: MemoryStore, zarr_format: ZarrFormat) -> None:
+    """
+    With erase=True, shrinking overwrites the out-of-bounds cells of boundary
+    chunks with the fill value, so truncated data does not reappear when the
+    array is grown again.
+    """
+    fill_value = -1
+    z = zarr.create(
+        shape=100,
+        chunks=10,
+        dtype="i4",
+        fill_value=fill_value,
+        store=store,
+        zarr_format=zarr_format,
+    )
+    z[:] = np.arange(100, dtype="i4")
+
+    z.resize(73, erase=True)
+    assert z.shape == (73,)
+    np.testing.assert_array_equal(np.arange(73, dtype="i4"), z[:])
+
+    # reopen the store and grow the array again
+    z2 = zarr.open_array(store=store, mode="r+")
+    z2.resize(100)
+    np.testing.assert_array_equal(np.arange(73, dtype="i4"), z2[:73])
+    np.testing.assert_array_equal(np.full(27, fill_value, dtype="i4"), z2[73:])
+
+
+@pytest.mark.parametrize("store", ["memory"], indirect=True)
+@pytest.mark.parametrize("new_size", [70, 0])
+def test_resize_erase_chunk_boundary_and_empty(
+    store: MemoryStore, zarr_format: ZarrFormat, new_size: int
+) -> None:
+    """
+    Erasing a shrink that lands exactly on a chunk boundary (or empties the
+    array) only needs to delete whole chunks; regrowing must still yield the
+    fill value everywhere outside the retained region.
+    """
+    fill_value = 7
+    z = zarr.create(
+        shape=100,
+        chunks=10,
+        dtype="i4",
+        fill_value=fill_value,
+        store=store,
+        zarr_format=zarr_format,
+    )
+    z[:] = np.arange(100, dtype="i4")
+
+    z.resize(new_size, erase=True)
+    assert z.shape == (new_size,)
+
+    z2 = zarr.open_array(store=store, mode="r+")
+    z2.resize(100)
+    np.testing.assert_array_equal(np.arange(new_size, dtype="i4"), z2[:new_size])
+    np.testing.assert_array_equal(np.full(100 - new_size, fill_value, dtype="i4"), z2[new_size:])
+
+
+@pytest.mark.parametrize("store", ["memory"], indirect=True)
+def test_resize_erase_2d(store: MemoryStore, zarr_format: ZarrFormat) -> None:
+    """Erasing a shrink along multiple axes at once."""
+    fill_value = 5
+    z = zarr.create(
+        shape=(105, 105),
+        chunks=(10, 10),
+        dtype="i4",
+        fill_value=fill_value,
+        store=store,
+        zarr_format=zarr_format,
+    )
+    a = np.arange(105 * 105, dtype="i4").reshape(105, 105)
+    z[:] = a
+
+    z.resize((53, 77), erase=True)
+    np.testing.assert_array_equal(a[:53, :77], z[:])
+
+    z2 = zarr.open_array(store=store, mode="r+")
+    z2.resize((105, 105))
+    expected = np.full((105, 105), fill_value, dtype="i4")
+    expected[:53, :77] = a[:53, :77]
+    np.testing.assert_array_equal(expected, z2[:])
+
+
+@pytest.mark.parametrize("store", ["memory"], indirect=True)
+def test_resize_erase_mixed_grow_shrink(store: MemoryStore, zarr_format: ZarrFormat) -> None:
+    """Erasing applies to the shrunk axes of a mixed grow/shrink resize."""
+    fill_value = 2
+    z = zarr.create(
+        shape=(50, 50),
+        chunks=(10, 10),
+        dtype="i4",
+        fill_value=fill_value,
+        store=store,
+        zarr_format=zarr_format,
+    )
+    b = np.arange(50 * 50, dtype="i4").reshape(50, 50)
+    z[:] = b
+
+    z.resize((80, 33), erase=True)
+    assert z.shape == (80, 33)
+    np.testing.assert_array_equal(b[:, :33], z[:50])
+    np.testing.assert_array_equal(np.full((30, 33), fill_value, dtype="i4"), z[50:])
+
+    z2 = zarr.open_array(store=store, mode="r+")
+    z2.resize((80, 50))
+    expected = np.full((80, 50), fill_value, dtype="i4")
+    expected[:50, :33] = b[:, :33]
+    np.testing.assert_array_equal(expected, z2[:])
+
+
+@pytest.mark.parametrize("store", ["memory"], indirect=True)
+def test_resize_erase_sharded(store: MemoryStore) -> None:
+    """Erasing works through the sharding codec (boundary shards are rewritten)."""
+    fill_value = 9
+    z = zarr.create_array(
+        store, shape=(100,), chunks=(10,), shards=(20,), dtype="i4", fill_value=fill_value
+    )
+    z[:] = np.arange(100, dtype="i4")
+
+    z.resize(73, erase=True)
+    np.testing.assert_array_equal(np.arange(73, dtype="i4"), z[:])
+
+    z2 = zarr.open_array(store=store, mode="r+")
+    z2.resize(100)
+    np.testing.assert_array_equal(np.arange(73, dtype="i4"), z2[:73])
+    np.testing.assert_array_equal(np.full(27, fill_value, dtype="i4"), z2[73:])
+
+
+@pytest.mark.parametrize("store", ["memory"], indirect=True)
+def test_resize_erase_missing_chunks(store: MemoryStore, zarr_format: ZarrFormat) -> None:
+    """Erasing tolerates chunks that were never written."""
+    fill_value = 3
+    z = zarr.create(
+        shape=100,
+        chunks=10,
+        dtype="i4",
+        fill_value=fill_value,
+        store=store,
+        zarr_format=zarr_format,
+    )
+    z[:45] = np.arange(45, dtype="i4")
+
+    z.resize(73, erase=True)
+    z2 = zarr.open_array(store=store, mode="r+")
+    z2.resize(100)
+    np.testing.assert_array_equal(np.arange(45, dtype="i4"), z2[:45])
+    np.testing.assert_array_equal(np.full(55, fill_value, dtype="i4"), z2[45:])
+
+
+@pytest.mark.parametrize("store", ["memory"], indirect=True)
+def test_resize_erase_leaves_interior_chunks_untouched(
+    store: MemoryStore, zarr_format: ZarrFormat
+) -> None:
+    """Chunks entirely inside the retained region are not decoded or rewritten."""
+    z = zarr.create(
+        shape=100, chunks=10, dtype="i4", fill_value=0, store=store, zarr_format=zarr_format
+    )
+    z[:] = np.arange(100, dtype="i4")
+
+    async def read_chunk_bytes(coords: tuple[int, ...]) -> bytes | None:
+        key = z.metadata.encode_chunk_key(coords)
+        buffer = await (z._async_array.store_path / key).get()
+        return None if buffer is None else buffer.to_bytes()
+
+    interior_before = sync(read_chunk_bytes((0,)))
+    boundary_before = sync(read_chunk_bytes((7,)))
+
+    z.resize(73, erase=True)
+
+    # chunk 0 lies entirely inside the new shape and must be byte-identical
+    assert interior_before is not None
+    assert sync(read_chunk_bytes((0,))) == interior_before
+    # chunk 7 is a boundary chunk and must have been rewritten
+    assert boundary_before is not None
+    assert sync(read_chunk_bytes((7,))) != boundary_before
+
+
+@pytest.mark.parametrize("store", ["memory"], indirect=True)
+def test_resize_erase_write_failure_leaves_shape_unchanged(
+    store: MemoryStore, zarr_format: ZarrFormat
+) -> None:
+    """
+    If erasing the boundary chunks fails, the resize reports the incomplete
+    truncation and the array keeps its old shape.
+    """
+    z = zarr.create(
+        shape=100, chunks=10, dtype="i4", fill_value=0, store=store, zarr_format=zarr_format
+    )
+    z[:] = np.arange(100, dtype="i4")
+
+    async def _failing_set(self: Store, *args: object, **kwargs: object) -> None:
+        raise OSError("simulated store write failure")
+
+    with (
+        mock.patch.object(MemoryStore, "set", _failing_set),
+        pytest.raises(RuntimeError, match="truncation is incomplete"),
+    ):
+        z.resize(55, erase=True)
+
+    assert z.shape == (100,)
+    # the metadata in the store still describes the old shape
+    z2 = zarr.open_array(store=store, mode="r")
+    assert z2.shape == (100,)
+    np.testing.assert_array_equal(np.arange(100, dtype="i4"), z2[:])
+
+
+@pytest.mark.parametrize("store", ["memory"], indirect=True)
+def test_resize_without_erase_preserves_boundary_data(
+    store: MemoryStore, zarr_format: ZarrFormat
+) -> None:
+    """The default resize behavior is unchanged: boundary chunk data reappears on regrow."""
+    z = zarr.create(
+        shape=100, chunks=10, dtype="i4", fill_value=0, store=store, zarr_format=zarr_format
+    )
+    z[:] = np.arange(100, dtype="i4")
+    z.resize(73)
+    z.resize(100)
+    # the boundary chunk (cells 70-79) is preserved, fully-outside chunks are deleted
+    np.testing.assert_array_equal(np.arange(80, dtype="i4"), z[:80])
+    np.testing.assert_array_equal(np.zeros(20, dtype="i4"), z[80:])
+
+
+@pytest.mark.parametrize("store", ["memory"], indirect=True)
 def test_append_1d(store: MemoryStore, zarr_format: ZarrFormat) -> None:
     a = np.arange(105)
     z = zarr.create(shape=a.shape, chunks=10, dtype=a.dtype, store=store, zarr_format=zarr_format)
