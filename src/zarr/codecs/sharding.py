@@ -224,6 +224,125 @@ class _ShardIndex(NamedTuple):
     def get_full_chunk_map(self) -> npt.NDArray[np.bool_]:
         return np.not_equal(self.offsets_and_lengths[..., 0], MAX_UINT_64)
 
+    def validate(
+        self,
+        *,
+        data_section_start: int,
+        data_section_end: int | None,
+        allow_empty_payloads: bool,
+    ) -> None:
+        """Check that every index entry points at a legal byte range.
+
+        A matching index checksum only proves the index bytes survived
+        transport; it says nothing about whether the offsets and lengths
+        inside are sane. Without this check a corrupt index can send partial
+        reads into the index region itself or past the end of the shard blob.
+
+        Rules enforced:
+        - a missing chunk must use the FULL missing marker
+          (MAX_UINT_64, MAX_UINT_64) -- a half-marker entry is corrupt;
+        - offset + length is computed with non-overflowing arithmetic and
+          must lie inside [data_section_start, data_section_end), the
+          shard's data section (data_section_end=None when the caller only
+          loaded the index and does not know the total shard size);
+        - zero-length payloads are legal only when allow_empty_payloads,
+          which the caller derives from the codec contract (a fixed-size
+          inner codec chain can never encode a chunk to zero bytes);
+        - non-empty payload intervals must not overlap -- the first
+          offending pair is reported with BOTH chunk coordinates.
+
+        The common case is fully vectorized, so the cost stays proportional
+        to the index size; chunk coordinates are only resolved on errors.
+        """
+        offsets = self.offsets_and_lengths[..., 0].reshape(-1)
+        lengths = self.offsets_and_lengths[..., 1].reshape(-1)
+
+        def coords_of(flat_index: int) -> tuple[int, ...]:
+            return tuple(
+                int(c)
+                for c in np.unravel_index(flat_index, self.offsets_and_lengths.shape[:-1])
+            )
+
+        offset_missing = offsets == MAX_UINT_64
+        length_missing = lengths == MAX_UINT_64
+        half_missing = offset_missing != length_missing
+        if bool(np.any(half_missing)):
+            bad = int(np.argmax(half_missing))
+            raise ValueError(
+                f"Corrupt shard index: chunk {coords_of(bad)} carries only half of the "
+                f"missing-chunk marker (offset={int(offsets[bad])}, "
+                f"length={int(lengths[bad])}); a missing chunk must be marked with "
+                f"offset == length == {MAX_UINT_64}."
+            )
+
+        present = ~offset_missing
+        if not bool(np.any(present)):
+            return
+        present_flats = np.nonzero(present)[0]
+        present_offsets = offsets[present]
+        present_lengths = lengths[present]
+
+        if not allow_empty_payloads and bool(np.any(present_lengths == 0)):
+            bad = int(present_flats[int(np.argmax(present_lengths == 0))])
+            raise ValueError(
+                f"Corrupt shard index: chunk {coords_of(bad)} has a zero-length "
+                "payload, which the fixed-size inner codec chain can never produce."
+            )
+
+        # offset + length without uint64 wraparound: a wrapped sum means the
+        # interval extends past 2**64 and cannot fit inside any real shard.
+        ends = present_offsets + present_lengths
+        overflowed = ends < present_offsets
+        if bool(np.any(overflowed)):
+            bad = int(present_flats[int(np.argmax(overflowed))])
+            raise ValueError(
+                f"Corrupt shard index: chunk {coords_of(bad)} has offset + length "
+                f"overflowing 64 bits (offset={int(offsets[bad])}, "
+                f"length={int(lengths[bad])})."
+            )
+
+        below = present_offsets < np.uint64(data_section_start)
+        if bool(np.any(below)):
+            bad = int(present_flats[int(np.argmax(below))])
+            raise ValueError(
+                f"Corrupt shard index: chunk {coords_of(bad)} starts at offset "
+                f"{int(offsets[bad])}, before the shard's data section "
+                f"(start={data_section_start}); it would read index bytes as chunk data."
+            )
+
+        if data_section_end is not None:
+            beyond = ends > np.uint64(data_section_end)
+            if bool(np.any(beyond)):
+                bad = int(present_flats[int(np.argmax(beyond))])
+                raise ValueError(
+                    f"Corrupt shard index: chunk {coords_of(bad)} spans "
+                    f"[{int(offsets[bad])}, {int(offsets[bad]) + int(lengths[bad])}), "
+                    f"past the end of the shard's data section (end={data_section_end})."
+                )
+
+        # Overlap: sort the non-empty intervals by offset; an overlap exists
+        # iff some interval starts before its predecessor ends. Zero-length
+        # intervals occupy no bytes and cannot conflict.
+        nonempty = present_lengths > 0
+        ne_flats = present_flats[nonempty]
+        ne_offsets = present_offsets[nonempty]
+        ne_ends = ends[nonempty]
+        order = np.argsort(ne_offsets, kind="stable")
+        sorted_offsets = ne_offsets[order]
+        sorted_ends = ne_ends[order]
+        if sorted_offsets.size > 1:
+            overlaps = sorted_offsets[1:] < sorted_ends[:-1]
+            if bool(np.any(overlaps)):
+                i = int(np.argmax(overlaps))
+                first = int(ne_flats[order[i]])
+                second = int(ne_flats[order[i + 1]])
+                raise ValueError(
+                    f"Corrupt shard index: the byte ranges of chunks {coords_of(first)} "
+                    f"and {coords_of(second)} overlap "
+                    f"([{int(sorted_offsets[i])}, {int(sorted_ends[i])}) and "
+                    f"[{int(sorted_offsets[i + 1])}, {int(sorted_ends[i + 1])}))."
+                )
+
     def is_dense(self, chunk_byte_length: int, *, data_section_start: int) -> bool:
         """True when the chunk payloads exactly tile the shard's data section.
 
@@ -339,6 +458,9 @@ class _ShardReader(ShardMapping):
             shard_index_bytes = obj.buf[-shard_index_size:]
 
         obj.index = await codec._decode_shard_index(shard_index_bytes, chunks_per_shard)
+        codec._validate_shard_index(
+            obj.index, chunks_per_shard=chunks_per_shard, shard_size=len(buf)
+        )
         return obj
 
     @classmethod
@@ -673,6 +795,7 @@ class ShardingCodec(
         else:
             shard_index_bytes = buf[-shard_index_size:]
         index = self._decode_shard_index_sync(shard_index_bytes, chunks_per_shard)
+        self._validate_shard_index(index, chunks_per_shard=chunks_per_shard, shard_size=len(buf))
         reader = _ShardReader()
         reader.buf = buf
         reader.index = index
@@ -1614,6 +1737,42 @@ class ShardingCodec(
             return RangeByteRequest(0, shard_index_size)
         return SuffixByteRequest(shard_index_size)
 
+    def _validate_shard_index(
+        self,
+        index: _ShardIndex,
+        *,
+        chunks_per_shard: tuple[int, ...],
+        shard_size: int | None,
+    ) -> None:
+        """Validate a decoded shard index against the shard's data section.
+
+        Every index-load path (full-shard reads, index-only partial reads,
+        and the old-index load before a partial write) must run this before
+        any index-derived byte range is requested, so a corrupt index is
+        rejected before it can send a read into the index region or past the
+        end of the shard.
+
+        `shard_size` is the total shard blob size in bytes, or None when the
+        caller only loaded the index (partial reads) and therefore cannot
+        check the upper bound. Empty payloads are legal only when the inner
+        codec chain is not fixed-size -- a fixed-size chain can never encode
+        a chunk to zero bytes, so a zero-length entry is corrupt there.
+        """
+        shard_index_size = self._shard_index_size(chunks_per_shard)
+        if self.index_location == "start":
+            data_section_start = shard_index_size
+            data_section_end = shard_size
+        else:
+            data_section_start = 0
+            data_section_end = (
+                None if shard_size is None else max(shard_size - shard_index_size, 0)
+            )
+        index.validate(
+            data_section_start=data_section_start,
+            data_section_end=data_section_end,
+            allow_empty_payloads=not self._inner_codecs_fixed_size,
+        )
+
     @staticmethod
     def _pair_chunks_with_byte_ranges(
         shard_index: _ShardIndex, all_chunk_coords: set[tuple[int, ...]]
@@ -1640,7 +1799,13 @@ class ShardingCodec(
             byte_range=self._shard_index_byte_range(chunks_per_shard),
         )
         if index_bytes is not None:
-            return await self._decode_shard_index(index_bytes, chunks_per_shard)
+            index = await self._decode_shard_index(index_bytes, chunks_per_shard)
+            # Only the index bytes are in hand, so the upper bound of the data
+            # section is unknown (shard_size=None); everything else -- full
+            # missing markers, overflow-free in-section offsets, no overlaps --
+            # is still enforced before any index-derived range is requested.
+            self._validate_shard_index(index, chunks_per_shard=chunks_per_shard, shard_size=None)
+            return index
         return None
 
     async def _load_full_shard_maybe(
@@ -1739,7 +1904,9 @@ class ShardingCodec(
             byte_range=self._shard_index_byte_range(chunks_per_shard),
         )
         if index_bytes is not None:
-            return self._decode_shard_index_sync(index_bytes, chunks_per_shard)
+            index = self._decode_shard_index_sync(index_bytes, chunks_per_shard)
+            self._validate_shard_index(index, chunks_per_shard=chunks_per_shard, shard_size=None)
+            return index
         return None
 
     def _load_partial_shard_maybe_sync(
