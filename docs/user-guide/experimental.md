@@ -358,3 +358,42 @@ print(f"Cache contains {info['cached_keys']} keys with {info['current_size']} by
 This example shows how the CacheStore can significantly reduce access times for repeated
 data reads, particularly important when working with remote data sources. The dual-store
 architecture allows for flexible cache persistence and management.
+
+## `VirtualConcatArray`
+
+Archives are often stored as one Zarr array per time slice -- for example one
+array per month, possibly spread across different stores. `VirtualConcatArray`
+presents such a collection as a single read-only array whose concatenation axis
+(e.g. `time`) is the concatenation of the component axes. Opening the view only
+reads array metadata; no pixel data or chunks are copied, and each component
+keeps its own chunking, compressor, and fill value.
+
+```python exec="true" session="experimental-concat" source="above" result="ansi"
+import numpy as np
+import zarr
+from zarr.experimental import VirtualConcatArray
+from zarr.storage import MemoryStore
+
+months = []
+for i in range(3):
+    data = np.arange(8).reshape(4, 2) + 100 * i
+    arr = zarr.create_array(
+        store=MemoryStore(), shape=data.shape, chunks=(2 + i, 2), dtype=data.dtype
+    )
+    arr[:] = data
+    months.append(arr)
+
+view = VirtualConcatArray(months, axis=0)
+print(view.shape)
+print(view[2:7])  # basic selection across the month boundary
+print(view.oindex[[3, 3, 4]])  # orthogonal selection; duplicates are preserved
+```
+
+Components must share a dtype and agree on every axis except the concatenation
+axis. Only the components that overlap a selection are read, so touching a few
+time points never opens the other months. If a component is resized after the
+view is created, reads raise `ConcatViewInvalidError` instead of silently
+shifting indexes. The view configuration can be serialized with
+`view.to_json()` and rebuilt with `VirtualConcatArray.from_json(...)`;
+credentials are never serialized, so authenticated stores are re-supplied by
+the caller via the `stores` argument.
