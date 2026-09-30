@@ -38,6 +38,7 @@ from zarr.core.group import (
     create_hierarchy,
 )
 from zarr.core.metadata import ArrayMetadataDict, ArrayV2Metadata
+from zarr.core.rechunk import RechunkResult, rechunk
 from zarr.errors import (
     ArrayNotFoundError,
     GroupNotFoundError,
@@ -87,6 +88,8 @@ __all__ = [
     "open_consolidated",
     "open_group",
     "open_like",
+    "RechunkResult",
+    "rechunk",
     "save",
     "save_array",
     "save_group",

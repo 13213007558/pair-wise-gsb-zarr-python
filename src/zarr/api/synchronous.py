@@ -8,6 +8,7 @@ import zarr.api.asynchronous as async_api
 import zarr.core.array
 from zarr.core.array import DEFAULT_FILL_VALUE, Array, AsyncArray, CompressorLike
 from zarr.core.group import Group
+from zarr.core.rechunk import RechunkResult
 from zarr.core.sync import sync
 from zarr.core.sync_group import create_hierarchy
 from zarr.errors import ZarrDeprecationWarning
@@ -66,6 +67,8 @@ __all__ = [
     "open_consolidated",
     "open_group",
     "open_like",
+    "RechunkResult",
+    "rechunk",
     "save",
     "save_array",
     "save_group",
@@ -134,6 +137,24 @@ def copy_store(*args: Any, **kwargs: Any) -> tuple[int, int, int]:
     Not implemented.
     """
     return sync(async_api.copy_store(*args, **kwargs))
+
+
+def rechunk(
+    source: Array,
+    target: Array,
+    *,
+    work_memory_budget: int,
+    temp_store: StoreLike | None = None,
+) -> RechunkResult:
+    """Synchronously copy an array to another chunk grid under a work-memory budget."""
+    return sync(
+        async_api.rechunk(
+            source.async_array,
+            target.async_array,
+            work_memory_budget=work_memory_budget,
+            temp_store=temp_store,
+        )
+    )
 
 
 def load(
